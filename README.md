@@ -26,7 +26,7 @@ agentd ctl learn ──► confirmed.jsonl ──► rust_trainer run ──► 
 | Resumable checkpoints (exact: an interrupted run gives bit-identical weights) | ✅ |
 | Eval gate, swap, keep-N rollback, ledger | ✅ |
 | Power/heat policy (Deep + charging + battery + temperature, with hysteresis) and overnight orchestration | ✅ |
-| Loader for HF Qwen2.5 / Qwen3 / Qwen3.5 / Qwen3-Next safetensors | ✅ written; parity with `transformers` checked on random-weight models (see below) |
+| Loader for HF Qwen2.5 / Qwen3 / Qwen3.5 / Qwen3-Next safetensors | ✅ written; parity harness vs `transformers`+`peft` (`tools/parity.py`) included but **not yet run**: PyTorch could not be installed in the build sandbox |
 | Hook into `agentos-llm` and `agentd` | ⏳ both repositories were empty when this was written; the integration points are listed below |
 | Measured improvement on real held-out corrections (plan step 3) | ⏳ needs real weights and real data |
 
@@ -139,6 +139,8 @@ This is exactly the layout Hugging Face PEFT writes. llama.cpp's `convert_lora_t
 
 * `tests/gradcheck.rs` checks every op and every mixer variant (dense attention with bias; gated, QK-normed partial-RoPE attention; DeltaNet with BPTT chunk sizes 1, 3, 4, 7 and 20) against central finite differences. It also checks LoRA gradients end-to-end through dense and hybrid models in f32 and Q8_0, and confirms that activation recomputation gives the same gradients as storing activations.
 * `tests/training.rs` checks that loss falls and the gate accepts; that pause/resume is exact; that DPO moves preferences (pairwise accuracy → 100%); that the adapter round-trips and engine `apply`/`merge` agree with training; that the overnight flow works (wait → train → heat pause → resume → accept; a second night rejected against the current adapter; skip; defer; rollback; exact ledger sequence); and the power-policy hysteresis.
+* `tools/parity.py` + `examples/parity.rs` (run manually, needs `torch transformers peft`) build random-weight Qwen2 / Qwen3.5 / Qwen3-Next models in `transformers`, attach a random PEFT LoRA, and compare base and adapted log-probs, the loss, and every LoRA gradient (autograd vs our backward). It also exercises the HF loader and PEFT adapter loading:
+  `cargo build --release --example parity && python tools/parity.py`
 * Unit tests cover the data filter, chat formatting and masking, the safetensors round-trip, the registry, the LR schedule and Q8_0.
 
 ## Feasibility on a phone (estimates, not measured on device)
