@@ -99,6 +99,9 @@ pub fn parse_config(root: &Value) -> io::Result<ModelConfig> {
                 rope_theta,
                 qk_norm: true,
                 output_gate: tc.get("attn_output_gate").and_then(Value::as_bool).unwrap_or(true),
+                rope_neox: true,
+                rope_freq_scale: 1.0,
+                kv_f16: false,
             },
             delta: Some(DeltaNetConfig {
                 n_k_heads: get_usize(tc, "linear_num_key_heads")?,
@@ -132,6 +135,9 @@ pub fn parse_config(root: &Value) -> io::Result<ModelConfig> {
                 rope_theta,
                 qk_norm: qwen3,
                 output_gate: false,
+                rope_neox: true,
+                rope_freq_scale: 1.0,
+                kv_f16: false,
             },
             delta: None,
             rms_eps: eps,
@@ -323,7 +329,7 @@ pub fn load_model(dir: impl AsRef<Path>, opts: &LoadOptions) -> io::Result<Model
         });
     }
     let final_norm = st.vec(&format!("{prefix}norm.weight"), d)?;
-    Ok(Model { cfg, embed, blocks, final_norm, lm_head, checkpointing: true, logits_chunk: 64 })
+    Ok(Model { cfg, embed, blocks, final_norm, lm_head, checkpointing: true, logits_chunk: 64, rope_factors: None })
 }
 
 /// Rough resource estimate for a config (used by `rust_trainer info`).

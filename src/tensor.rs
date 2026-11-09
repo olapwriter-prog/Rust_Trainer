@@ -6,8 +6,23 @@ use rayon::prelude::*;
 /// Rows per rayon task in the matmul kernels.
 const ROW_CHUNK: usize = 4;
 
+/// Dot product. With the `rie` feature this is the inference engine's own
+/// SIMD `dot_f32`, so reductions round exactly as they do on the phone.
+#[cfg(feature = "rie")]
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    rie_core::kernels::dot_f32(a, b)
+}
+
+#[cfg(not(feature = "rie"))]
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    dot_portable(a, b)
+}
+
+#[inline]
+pub fn dot_portable(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     // 4-way unrolled accumulation: faster and slightly more accurate than a naive loop.
     let n = a.len();
@@ -118,9 +133,10 @@ pub fn sigmoid(x: f32) -> f32 {
     }
 }
 
+/// `x·σ(x)`, written as the engine writes it (`x / (1 + e^{-x})`) so it rounds identically.
 #[inline]
 pub fn silu(x: f32) -> f32 {
-    x * sigmoid(x)
+    x / (1.0 + (-x).exp())
 }
 
 /// d/dx silu(x)

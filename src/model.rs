@@ -55,6 +55,9 @@ impl ModelConfig {
                 rope_theta: 10000.0,
                 qk_norm: false,
                 output_gate: false,
+                rope_neox: true,
+                rope_freq_scale: 1.0,
+                kv_f16: false,
             },
             delta: None,
             rms_eps: 1e-6,
@@ -85,6 +88,9 @@ impl ModelConfig {
                 rope_theta: 10000.0,
                 qk_norm: true,
                 output_gate: true,
+                rope_neox: true,
+                rope_freq_scale: 1.0,
+                kv_f16: false,
             },
             delta: Some(DeltaNetConfig {
                 n_k_heads: 2,
@@ -246,6 +252,22 @@ pub struct Model {
     pub checkpointing: bool,
     /// Rows of logits computed at once (bounds the `[rows × vocab]` buffer).
     pub logits_chunk: usize,
+    /// Per-frequency RoPE divisors (Llama 3.1+ `rope_freqs`), as in the engine.
+    pub rope_factors: Option<Vec<f32>>,
+}
+
+/// Map GGUF module names to the Hugging Face names used for LoRA targets.
+pub fn canonical_module(name: &str) -> &str {
+    match name {
+        "attn_q" => "q_proj",
+        "attn_k" => "k_proj",
+        "attn_v" => "v_proj",
+        "attn_output" => "o_proj",
+        "ffn_gate" => "gate_proj",
+        "ffn_up" => "up_proj",
+        "ffn_down" => "down_proj",
+        other => other,
+    }
 }
 
 /// Which projections receive LoRA adapters (matched against the last path component).
@@ -351,18 +373,20 @@ impl Model {
         }
         let final_norm = norm(&mut rng, d, off);
         let lm_head = if cfg.tie_embeddings { embed.clone() } else { mk(&mut rng, cfg.vocab_size, d) };
-        Model { cfg, embed, blocks, final_norm, lm_head, checkpointing: true, logits_chunk: 64 }
+        Model { cfg, embed, blocks, final_norm, lm_head, checkpointing: true, logits_chunk: 64, rope_factors: None }
     }
 
-    /// Attach fresh LoRA adapters to every linear whose last name component is in `targets`.
+    /// Attach fresh LoRA adapters to every linear whose last name component is in `targets`
+    /// (Hugging Face names; GGUF names such as `attn_q`/`ffn_down` are matched through
+    /// [`canonical_module`]).
     /// Returns the number of trainable parameters.
     pub fn attach_lora(&mut self, rank: usize, alpha: f32, targets: &[&str], seed: u64) -> usize {
         let mut rng = Rng::new(seed);
         let mut n = 0;
         for b in &mut self.blocks {
             for l in b.linears_mut() {
-                let short = l.name.rsplit('.').next().unwrap_or("");
-                if targets.contains(&short) {
+                let short = canonical_module(l.name.rsplit('.').next().unwrap_or(""));
+                if targets.iter().any(|t| canonical_module(t) == short) {
                     l.attach_lora(rank, alpha, &mut rng);
                     n += l.lora.as_ref().unwrap().num_params();
                 }
@@ -411,7 +435,8 @@ impl Model {
     }
 
     fn rope(&self, t: usize) -> Rope {
-        Rope::new(t, self.cfg.attn.rot_dim, self.cfg.attn.rope_theta)
+        let a = &self.cfg.attn;
+        Rope::with(t, a.rot_dim, a.rope_neox, a.rope_theta, a.rope_freq_scale, self.rope_factors.as_deref())
     }
 
     /// Final hidden states (after the last block, before the final norm).

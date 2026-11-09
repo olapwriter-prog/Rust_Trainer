@@ -2,6 +2,8 @@
 name = "rust_trainer"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
+repository = "https://github.com/olapwriter-prog/Rust_Trainer"
 description = "On-device LoRA trainer for the agentOS Qwen engine: backprop through Qwen2.5/Qwen3.5 (incl. Gated DeltaNet), AdamW, eval gate, adapter registry and power-aware scheduling."
 license = "MIT OR Apache-2.0"
 
@@ -17,18 +19,24 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1"
+# The inference engine: GGUF reader, ggml quant formats and SIMD matmul kernels.
+# Training runs its forward pass through these exact kernels.
+rie-core = { git = "https://github.com/olapwriter-prog/Rust_Interference_engine", optional = true }
 tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
 
 [profile.release]
 opt-level = 3
 debug = false
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+panic = "abort"
 
 [profile.test]
 opt-level = 2
 
 [features]
-default = []
+default = ["rie"]
+# Load GGUF models through the Rust Inference Engine and train against its kernels.
+rie = ["dep:rie-core"]
 # Load a Hugging Face tokenizer.json (Qwen BPE) for training on raw text.
 hf-tokenizers = ["dep:tokenizers"]

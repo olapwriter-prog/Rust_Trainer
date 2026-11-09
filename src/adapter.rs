@@ -104,6 +104,12 @@ pub fn save_adapter(model: &Model, dir: impl AsRef<Path>, meta: &AdapterMeta) ->
     });
     write_json(dir.join(CONFIG_FILE), &cfg)?;
     write_json(dir.join(META_FILE), meta)?;
+    // Models loaded from GGUF through the engine use GGUF tensor names (`blk.N.…`):
+    // also write the llama.cpp-style LoRA GGUF the engine loads.
+    #[cfg(feature = "rie")]
+    if lins.iter().all(|l| l.name.starts_with("blk.")) {
+        crate::rie::write_gguf_adapter(model, dir.join(crate::rie::GGUF_ADAPTER_FILE))?;
+    }
     Ok(())
 }
 

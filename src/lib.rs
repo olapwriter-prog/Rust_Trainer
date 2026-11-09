@@ -20,6 +20,8 @@ pub mod eval;
 pub mod hf;
 pub mod optim;
 pub mod registry;
+#[cfg(feature = "rie")]
+pub mod rie;
 pub mod safetensors;
 pub mod scheduler;
 pub mod tokenizer;

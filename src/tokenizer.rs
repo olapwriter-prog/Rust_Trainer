@@ -146,25 +146,46 @@ impl ChatFormat {
     /// Build a training example, truncating the *prompt* from the left (and, if
     /// the answer alone is too long, the answer's tail) to fit `max_len`.
     pub fn example(&self, tok: &dyn Tokenizer, system: Option<&str>, prompt: &Text, answer: &Text) -> Option<Example> {
-        let mut p = self.prompt(tok, system, prompt);
-        let mut a = self.answer(tok, answer);
-        if a.is_empty() {
-            return None;
-        }
-        let max = self.max_len.max(2);
-        if a.len() > max - 1 {
-            a.truncate(max - 1);
-        }
-        if p.len() + a.len() > max {
-            let drop = p.len() + a.len() - max;
-            p.drain(..drop);
-        }
-        if p.is_empty() {
-            return None;
-        }
-        let answer_start = p.len();
-        p.extend(a);
-        Some(Example { tokens: p, answer_start })
+        fit(self.prompt(tok, system, prompt), self.answer(tok, answer), self.max_len)
+    }
+}
+
+/// Join prompt and answer tokens into an [`Example`] of at most `max_len` tokens,
+/// dropping prompt tokens from the left first and then the answer's tail.
+pub fn fit(mut p: Vec<u32>, mut a: Vec<u32>, max_len: usize) -> Option<Example> {
+    if a.is_empty() {
+        return None;
+    }
+    let max = max_len.max(2);
+    if a.len() > max - 1 {
+        a.truncate(max - 1);
+    }
+    if p.len() + a.len() > max {
+        let drop = p.len() + a.len() - max;
+        p.drain(..drop);
+    }
+    if p.is_empty() {
+        return None;
+    }
+    let answer_start = p.len();
+    p.extend(a);
+    Some(Example { tokens: p, answer_start })
+}
+
+/// Turns a (system, prompt, answer) record into a tokenised training example.
+pub trait Formatter {
+    fn example(&self, system: Option<&str>, prompt: &Text, answer: &Text) -> Option<Example>;
+}
+
+/// [`ChatFormat`] bound to a tokenizer.
+pub struct ChatMl<'a> {
+    pub fmt: ChatFormat,
+    pub tok: &'a dyn Tokenizer,
+}
+
+impl Formatter for ChatMl<'_> {
+    fn example(&self, system: Option<&str>, prompt: &Text, answer: &Text) -> Option<Example> {
+        self.fmt.example(self.tok, system, prompt, answer)
     }
 }
 

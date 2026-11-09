@@ -6,6 +6,12 @@ use crate::tensor::{dot, silu, silu_grad};
 /// Qwen2.5 uses `offset = 0`; Qwen3.5 ("zero-centred" norm) uses `offset = 1`.
 /// Returns `(y, inv_rms per row)`.
 pub fn rmsnorm(x: &[f32], w: &[f32], d: usize, eps: f32, offset: f32) -> (Vec<f32>, Vec<f32>) {
+    rmsnorm_ordered(x, w, d, eps, offset, false)
+}
+
+/// RMSNorm with an explicit rounding order: `(x·s)·w` (`fused_scale = false`, the
+/// engine's block/final norms) or `x·(s·w)` (`true`, the engine's in-place QK-norm).
+pub fn rmsnorm_ordered(x: &[f32], w: &[f32], d: usize, eps: f32, offset: f32, fused_scale: bool) -> (Vec<f32>, Vec<f32>) {
     assert_eq!(w.len(), d);
     assert_eq!(x.len() % d, 0);
     let rows = x.len() / d;
@@ -16,8 +22,14 @@ pub fn rmsnorm(x: &[f32], w: &[f32], d: usize, eps: f32, offset: f32) -> (Vec<f3
         let ms = dot(xr, xr) / d as f32;
         let ir = 1.0 / (ms + eps).sqrt();
         inv[r] = ir;
-        for i in 0..d {
-            y[r * d + i] = xr[i] * ir * (w[i] + offset);
+        if fused_scale {
+            for i in 0..d {
+                y[r * d + i] = xr[i] * (ir * (w[i] + offset));
+            }
+        } else {
+            for i in 0..d {
+                y[r * d + i] = xr[i] * ir * (w[i] + offset);
+            }
         }
     }
     (y, inv)
@@ -74,29 +86,46 @@ pub fn l2norm_backward(y: &[f32], norms: &[f32], dy: &[f32], d: usize) -> Vec<f3
     dx
 }
 
-/// Precomputed cos/sin for NeoX-style ("rotate_half") rotary embedding applied to
-/// the first `rot_dim` dims of each head (partial rotary for Qwen3.5).
+/// Precomputed cos/sin for rotary embedding over the first `rot_dim` dims of
+/// each head. NEOX style rotates `(x[i], x[i+rot/2])` (Qwen); normal / GPT-J
+/// style rotates `(x[2i], x[2i+1])` (Llama GGUF layout). Frequencies are
+/// computed exactly like the inference engine (`rie_core::ops::Rope`), in f32.
 pub struct Rope {
     pub rot_dim: usize,
+    pub neox: bool,
     pub cos: Vec<f32>, // [t × rot_dim/2]
     pub sin: Vec<f32>,
 }
 
 impl Rope {
     pub fn new(t: usize, rot_dim: usize, theta: f32) -> Self {
+        Self::with(t, rot_dim, true, theta, 1.0, None)
+    }
+
+    pub fn with(t: usize, rot_dim: usize, neox: bool, base: f32, freq_scale: f32, factors: Option<&[f32]>) -> Self {
         assert!(rot_dim % 2 == 0);
         let half = rot_dim / 2;
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|i| {
+                let mut f = base.powf(-2.0 * i as f32 / rot_dim as f32) * freq_scale;
+                if let Some(fac) = factors {
+                    if i < fac.len() && fac[i] != 0.0 {
+                        f /= fac[i];
+                    }
+                }
+                f
+            })
+            .collect();
         let mut cos = vec![0.0; t * half];
         let mut sin = vec![0.0; t * half];
         for p in 0..t {
-            for i in 0..half {
-                let inv_freq = (theta as f64).powf(-(2.0 * i as f64) / rot_dim as f64);
-                let a = p as f64 * inv_freq;
-                cos[p * half + i] = a.cos() as f32;
-                sin[p * half + i] = a.sin() as f32;
+            for (i, f) in inv_freq.iter().enumerate() {
+                let (s, c) = (p as f32 * f).sin_cos();
+                cos[p * half + i] = c;
+                sin[p * half + i] = s;
             }
         }
-        Rope { rot_dim, cos, sin }
+        Rope { rot_dim, neox, cos, sin }
     }
 
     /// In-place rotation of `x` laid out `[t × heads × head_dim]`.
@@ -110,10 +139,10 @@ impl Rope {
                 for i in 0..half {
                     let c = self.cos[p * half + i];
                     let s = sgn * self.sin[p * half + i];
-                    let x1 = x[base + i];
-                    let x2 = x[base + i + half];
-                    x[base + i] = x1 * c - x2 * s;
-                    x[base + i + half] = x2 * c + x1 * s;
+                    let (a, b) = if self.neox { (base + i, base + i + half) } else { (base + 2 * i, base + 2 * i + 1) };
+                    let (x1, x2) = (x[a], x[b]);
+                    x[a] = x1 * c - x2 * s;
+                    x[b] = x2 * c + x1 * s;
                 }
             }
         }
