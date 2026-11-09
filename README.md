@@ -24,9 +24,10 @@ agentd ctl learn ──► confirmed.jsonl ──► rust_trainer run ───�
 | Training loop: AdamW, warm-up + cosine LR, clipping, answer-token loss, activation recomputation, chunked BPTT state checkpoints; DPO on corrections | ✅ |
 | Confirmed-only data, exact pause/resume, eval gate, swap, keep-5 rollback, ledger, Deep/charging/battery/heat policy with hysteresis | ✅ tested; end-to-end CLI run in CI |
 | **Mixture of LoRA experts** (`--experts K`): skill grouping (labels or clustering), branch-trained experts, TF-IDF router, per-expert gate | ✅ tested; routing recipe for the engine in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md#6-mixture-of-experts-bundles) |
+| **Open-source sandbox**: real Qwen3-0.6B GGUF (Docker model catalog), SNIPS requests → actions, phone-night simulator (stage, charging, battery, CPU-driven thermal model, unplug), exact-action eval | ✅ [`docs/SANDBOX.md`](docs/SANDBOX.md); found and fixed two heat-limit overshoots |
 | `agentd` side (status file, launch, reload) | ⏳ `agenticOS` is still empty; contract in [`docs/AGENTD.md`](docs/AGENTD.md) |
 | Engine side (load and apply `adapter.gguf`) | ⏳ in the engine's own session; spec and acceptance test in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md) |
-| Measured improvement on real held-out corrections (plan step 3) | ⏳ needs a real GGUF and real confirmed data (Hugging Face downloads are blocked in this sandbox) |
+| Measured improvement on held-out requests with a real model (plan step 3) | ✅ in the sandbox: real Qwen3-0.6B Q4_0, one simulated night, 140 open-dataset requests → exact action 0 % → 42.9 %, intent 0 % → 97.6 % on 42 unseen requests. ⏳ on your own corrections |
 | Parity of the HF/Qwen3.5 path with `transformers` + `peft` | ⏳ harness in `tools/parity.py`, not yet run (no PyTorch here) |
 
 ## Build

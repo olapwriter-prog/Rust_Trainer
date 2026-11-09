@@ -9,6 +9,7 @@
 //! rust_trainer rollback --model DIR [--reason TEXT]
 //! rust_trainer status   --model DIR
 //! rust_trainer route    --model M.gguf --prompt TEXT [--adapter BUNDLE]   (mixture: which expert)
+//! rust_trainer act-eval --model M.gguf --data FILE [--adapter DIR]        (exact action accuracy)
 //! rust_trainer synth    --out FILE.gguf [--arch qwen3 | --preset qwen3-0.6b] [--wtype Q4_0]
 //! ```
 //! Options: `--rank 8 --alpha 16 --lr 2e-4 --epochs 2 --batch 4 --max-len 512
@@ -75,7 +76,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: rust_trainer <toy|info|train|eval|run|route|rollback|status|synth> [--options]  (see README.md)".to_string()
+    "usage: rust_trainer <toy|info|train|eval|act-eval|run|route|rollback|status|synth> [--options]  (see README.md)".to_string()
 }
 
 fn main() -> ExitCode {
@@ -95,6 +96,7 @@ fn main() -> ExitCode {
         "rollback" => cmd_rollback(&args),
         "status" => cmd_status(&args),
         "route" => cmd_route(&args),
+        "act-eval" => cmd_act_eval(&args),
         #[cfg(feature = "rie")]
         "synth" => cmd_synth(&args),
         _ => Err(usage()),
@@ -461,6 +463,76 @@ fn cmd_status(a: &Args) -> Result<(), String> {
         println!("  {} {:<9} {:<14} {}", e.ts, e.event, e.adapter.as_deref().unwrap_or("-"), e.detail);
     }
     Ok(())
+}
+
+/// Held-out *action* accuracy: does greedy decoding produce exactly the confirmed
+/// answer, and (for JSON actions with an "intent") the right intent? Computed
+/// exactly from one teacher-forced pass per example (see `eval::greedy_prefix`).
+/// Compares the base model with `--adapter` (single adapter or mixture).
+#[cfg(feature = "rie")]
+fn cmd_act_eval(a: &Args) -> Result<(), String> {
+    use rust_trainer::eval::greedy_prefix;
+    let loaded = load(a)?;
+    let p = prepare(a, &loaded, &TrainConfig::default())?;
+    let Some((tok, _)) = &loaded.engine else { return Err("act-eval needs a GGUF model".into()) };
+    let mut model = loaded.model;
+    // Tokens up to and including the intent name, per example (if the answer is a JSON action).
+    let intent_len = |ex: &Example| -> Option<usize> {
+        let ans = tok.decode(&ex.tokens[ex.answer_start..], false);
+        let v: serde_json::Value = serde_json::from_str(ans.trim()).ok()?;
+        let intent = v.get("intent")?.as_str()?;
+        Some(tok.encode(&format!("{{\"intent\":\"{intent}"), false, false).len())
+    };
+    let ilens: Vec<Option<usize>> = p.held_sft.iter().map(intent_len).collect();
+    let score = |model: &Model, examples: &[(usize, &Example)]| -> (usize, usize, usize) {
+        let (mut exact, mut intent, mut with_intent) = (0, 0, 0);
+        for (i, ex) in examples {
+            let (ok, n) = greedy_prefix(model, ex);
+            exact += (ok == n) as usize;
+            if let Some(l) = ilens[*i] {
+                with_intent += 1;
+                intent += (ok >= l.min(n)) as usize;
+            }
+        }
+        (exact, intent, with_intent)
+    };
+    let all: Vec<(usize, &Example)> = p.held_sft.iter().enumerate().collect();
+    let n = all.len();
+    let report = |name: &str, (e, i, w): (usize, usize, usize)| {
+        println!(
+            "{name:<10} exact action {e:>4}/{n} = {:5.1}%   intent {i:>4}/{w} = {:5.1}%",
+            100.0 * e as f32 / n.max(1) as f32,
+            100.0 * i as f32 / w.max(1) as f32
+        );
+    };
+    model.set_lora_enabled(false);
+    report("base", score(&model, &all));
+    if let Some(dir) = a.get("adapter") {
+        if is_bundle(dir) {
+            let router = load_router(dir).map_err(|e| e.to_string())?;
+            let mut by: std::collections::BTreeMap<Option<String>, Vec<(usize, &Example)>> = Default::default();
+            for (i, ex) in &all {
+                by.entry(router.route(rust_trainer::moe::prompt_of(ex)).expert).or_default().push((*i, *ex));
+            }
+            let mut tot = (0, 0, 0);
+            for (expert, items) in by {
+                rust_trainer::moe::select_expert(&mut model, Path::new(dir), expert.as_deref()).map_err(|e| e.to_string())?;
+                let (e, i, w) = score(&model, &items);
+                println!("  expert {:<10} {} requests: exact {e}, intent {i}/{w}", expert.as_deref().unwrap_or("(base)"), items.len());
+                tot = (tot.0 + e, tot.1 + i, tot.2 + w);
+            }
+            report("mixture", tot);
+        } else {
+            load_adapter_dir(&mut model, dir)?;
+            report("adapter", score(&model, &all));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "rie"))]
+fn cmd_act_eval(_a: &Args) -> Result<(), String> {
+    Err("act-eval needs a GGUF model (build with the `rie` feature)".into())
 }
 
 /// Show which expert of a mixture a prompt is routed to (GGUF models).

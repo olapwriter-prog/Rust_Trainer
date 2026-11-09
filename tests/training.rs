@@ -7,7 +7,7 @@ use rust_trainer::data::Text;
 use rust_trainer::eval::{evaluate_vs_base, measure, GateConfig};
 use rust_trainer::model::{answer_targets, Model, ModelConfig};
 use rust_trainer::registry::Registry;
-use rust_trainer::scheduler::{run_overnight, DeviceMonitor, DeviceState, Heldout, JobConfig, Outcome, PowerPolicy, Stage};
+use rust_trainer::scheduler::{run_overnight, DeviceMonitor, DeviceState, FixedMonitor, Heldout, JobConfig, Outcome, PowerPolicy, Stage};
 use rust_trainer::tokenizer::{ByteTokenizer, ChatFormat, Example};
 use rust_trainer::train::{Objective, PrefPair, RunToEnd, StopAfter, StopReason, TrainConfig, TrainData, Trainer};
 use std::cell::RefCell;
@@ -333,4 +333,108 @@ fn power_policy_hysteresis() {
     assert!(p.check(&s(Stage::Deep, true, 80.0, 38.5), true).is_ok());
     assert!(p.check(&s(Stage::Deep, true, 80.0, 38.5), false).is_err());
     assert!(p.check(&s(Stage::Deep, true, 80.0, 40.0), true).is_err());
+}
+
+/// Stops *inside* an example after `n` layer checks (as when the phone overheats
+/// mid-way through a long example).
+struct StopWithin(usize);
+impl rust_trainer::train::Control for StopWithin {
+    fn should_continue(&mut self) -> bool {
+        true
+    }
+    fn should_continue_within(&mut self) -> bool {
+        if self.0 == 0 {
+            return false;
+        }
+        self.0 -= 1;
+        true
+    }
+}
+
+#[test]
+fn abort_inside_an_example_resumes_exactly() {
+    let (tr, _) = toy_sets();
+    let dir = tmpdir("abort-within");
+    let ckpt = dir.join("ck.safetensors");
+    let mut m1 = small_model(8, false);
+    let mut t1 = Trainer::new(&mut m1, cfg(2), TrainData::Sft(tr.clone()));
+    t1.run(&mut RunToEnd, None, |_| {}).unwrap();
+    let full: Vec<Vec<f32>> = t1.model.lora_linears().iter().map(|l| l.lora.as_ref().unwrap().b.clone()).collect();
+
+    // 4 blocks → 8 checks per example; 61 lands in the backward pass of an example mid-batch.
+    let mut m2 = small_model(8, false);
+    let mut t2 = Trainer::new(&mut m2, cfg(2), TrainData::Sft(tr.clone()));
+    assert_eq!(t2.run(&mut StopWithin(61), Some(&ckpt), |_| {}).unwrap(), StopReason::Paused);
+    let paused_at = t2.state.step;
+    let mut m3 = small_model(8, false);
+    let mut t3 = Trainer::new(&mut m3, cfg(2), TrainData::Sft(tr.clone()));
+    t3.load_checkpoint(&ckpt).unwrap();
+    assert_eq!(t3.state.step, paused_at);
+    t3.run(&mut RunToEnd, Some(&ckpt), |_| {}).unwrap();
+    let resumed: Vec<Vec<f32>> = t3.model.lora_linears().iter().map(|l| l.lora.as_ref().unwrap().b.clone()).collect();
+    assert_eq!(full, resumed);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Hot as soon as the trainer reports the evaluation phase.
+struct HotDuringEval {
+    status: std::path::PathBuf,
+}
+impl DeviceMonitor for HotDuringEval {
+    fn state(&mut self) -> io::Result<DeviceState> {
+        let evaluating = std::fs::read_to_string(&self.status).map(|s| s.contains("\"evaluating\"")).unwrap_or(false);
+        Ok(DeviceState { stage: Stage::Deep, charging: true, battery_pct: 90.0, temp_c: if evaluating { 45.0 } else { 30.0 } })
+    }
+}
+
+#[test]
+fn evaluation_also_respects_the_power_policy() {
+    let (tr, he) = toy_sets();
+    let dir = tmpdir("eval-policy");
+    let registry = Registry::open(&dir).unwrap();
+    let job = JobConfig {
+        base_model: "tiny".into(),
+        train: cfg(3),
+        gate: GateConfig { min_examples: 3, ..Default::default() },
+        power: PowerPolicy::default(),
+        min_train_examples: 5,
+    };
+    // Night 1: training completes, the phone overheats when evaluation starts, deadline passes.
+    let mut m = small_model(9, true);
+    let mut mon = HotDuringEval { status: registry.work_dir().join("status.json") };
+    let mut give_up = || false;
+    let out = run_overnight(
+        &mut m,
+        &registry,
+        &job,
+        TrainData::Sft(tr.clone()),
+        Heldout { sft: &he, pref: &[] },
+        &mut mon,
+        &mut give_up,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(matches!(out, Outcome::Deferred { .. }), "{out:?}");
+    let last = registry.read_ledger().pop().unwrap();
+    assert_eq!(last.event, "deferred");
+    assert_eq!(last.detail["phase"], "evaluating");
+    assert!(registry.active().is_none());
+    assert!(registry.work_dir().join("checkpoint.safetensors").exists(), "finished training is kept");
+
+    // Night 2: cool; resumes the finished run, evaluates and accepts without retraining.
+    let mut m = small_model(9, true);
+    let mut cool = FixedMonitor(DeviceState { stage: Stage::Deep, charging: true, battery_pct: 90.0, temp_c: 30.0 });
+    let mut steps_trained = 0;
+    let out =
+        run_overnight(&mut m, &registry, &job, TrainData::Sft(tr), Heldout { sft: &he, pref: &[] }, &mut cool, &mut || true, &mut |line| {
+            if line.starts_with("step ") {
+                steps_trained += 1;
+            }
+        })
+        .unwrap();
+    assert!(matches!(out, Outcome::Accepted { .. }), "{out:?}");
+    assert_eq!(steps_trained, 0, "no retraining after a deferred evaluation");
+    let events: Vec<String> = registry.read_ledger().into_iter().map(|e| e.event).collect();
+    assert_eq!(events, vec!["started", "deferred", "resumed", "accepted"]);
+    std::fs::remove_dir_all(dir).ok();
 }

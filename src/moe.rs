@@ -29,7 +29,7 @@
 //! `adapter.gguf`), so the registry's promote / reject / rollback work unchanged.
 
 use crate::adapter::load_adapter_into;
-use crate::eval::{measure_sums, Sums};
+use crate::eval::{measure_sums_paced, Sums};
 use crate::model::Model;
 use crate::tensor::{dot, Rng};
 use crate::tokenizer::Example;
@@ -392,16 +392,28 @@ pub fn prompt_of(ex: &Example) -> &[u32] {
 /// Evaluate a configuration on held-out data; bundles route every example and load
 /// each expert once.
 pub fn measure_current(model: &mut Model, cur: &Current, sft: &[Example], pref: &[PrefPair]) -> io::Result<Sums> {
+    measure_current_paced(model, cur, sft, pref, &mut || true).map(|o| o.expect("never stopped"))
+}
+
+/// [`measure_current`] with a `pace` callback before every example (see
+/// [`crate::eval::measure_sums_paced`]); `Ok(None)` if it gave up.
+pub fn measure_current_paced(
+    model: &mut Model,
+    cur: &Current,
+    sft: &[Example],
+    pref: &[PrefPair],
+    pace: &mut dyn FnMut() -> bool,
+) -> io::Result<Option<Sums>> {
     match cur {
         Current::Base => {
             model.set_lora_enabled(false);
-            let s = measure_sums(model, sft, pref);
+            let s = measure_sums_paced(model, sft, pref, pace);
             model.set_lora_enabled(true);
             Ok(s)
         }
         Current::Single(d) => {
             load_adapter_into(model, d)?;
-            Ok(measure_sums(model, sft, pref))
+            Ok(measure_sums_paced(model, sft, pref, pace))
         }
         Current::Bundle(d, r) => {
             let mut by: BTreeMap<Option<String>, (Vec<Example>, Vec<PrefPair>)> = BTreeMap::new();
@@ -414,10 +426,16 @@ pub fn measure_current(model: &mut Model, cur: &Current, sft: &[Example], pref: 
             let mut total = Sums::default();
             for (expert, (s, p)) in by {
                 select_expert(model, d, expert.as_deref())?;
-                total.add(&measure_sums(model, &s, &p));
+                match measure_sums_paced(model, &s, &p, pace) {
+                    Some(x) => total.add(&x),
+                    None => {
+                        model.set_lora_enabled(true);
+                        return Ok(None);
+                    }
+                }
             }
             model.set_lora_enabled(true);
-            Ok(total)
+            Ok(Some(total))
         }
     }
 }

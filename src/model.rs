@@ -420,6 +420,35 @@ impl Model {
         self.lm_head.forward(&n, 1)
     }
 
+    /// Full logits (`[positions.len() × vocab]`) at the given positions.
+    pub fn logits_at(&self, tokens: &[u32], positions: &[usize]) -> Vec<f32> {
+        let d = self.hidden();
+        let x = self.forward_hidden(tokens);
+        let mut xs = vec![0.0; positions.len() * d];
+        for (i, &p) in positions.iter().enumerate() {
+            xs[i * d..(i + 1) * d].copy_from_slice(&x[p * d..(p + 1) * d]);
+        }
+        let (n, _) = rmsnorm(&xs, &self.final_norm, d, self.cfg.rms_eps, self.cfg.norm_offset);
+        self.lm_head.forward(&n, positions.len())
+    }
+
+    /// Greedy decoding (recomputes the prefix each step; meant for short answers in
+    /// evaluation, not for serving). Stops at any token in `stop`.
+    pub fn generate_greedy(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Vec<u32> {
+        let mut toks = prompt.to_vec();
+        let mut out = Vec::new();
+        for _ in 0..max_new {
+            let l = self.last_logits(&toks);
+            let next = (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
+            if stop.contains(&next) {
+                break;
+            }
+            out.push(next);
+            toks.push(next);
+        }
+        out
+    }
+
     /// Log-probabilities of each target (no gradient).
     pub fn logprobs(&self, tokens: &[u32], targets: &[Target]) -> Vec<f32> {
         self.score(tokens, targets).0
@@ -487,6 +516,21 @@ impl Model {
     /// Forward + backward for `L = -Σ wᵢ·logpᵢ`. Accumulates LoRA gradients
     /// (call [`Model::zero_grad`] first) and returns the per-target log-probs.
     pub fn forward_backward(&mut self, tokens: &[u32], targets: &[Target], weights: &[f32]) -> Vec<f32> {
+        self.forward_backward_until(tokens, targets, weights, &mut || false).expect("never stopped")
+    }
+
+    /// [`Model::forward_backward`] that consults `stop` before every block of the
+    /// forward and backward pass and returns `None` as soon as it says stop. The
+    /// partial LoRA gradients must then be discarded (the trainer zeroes them). This
+    /// lets a long example be abandoned mid-way when the phone gets too hot or is
+    /// unplugged, instead of finishing first.
+    pub fn forward_backward_until(
+        &mut self,
+        tokens: &[u32],
+        targets: &[Target],
+        weights: &[f32],
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<f32>> {
         assert_eq!(targets.len(), weights.len());
         let t = tokens.len();
         let rope = self.rope(t);
@@ -495,6 +539,9 @@ impl Model {
         let mut inputs: Vec<Vec<f32>> = Vec::new();
         let mut caches: Vec<BlockCache> = Vec::new();
         for b in &self.blocks {
+            if stop() {
+                return None;
+            }
             if self.checkpointing {
                 inputs.push(x.clone());
                 x = b.forward(&x, t, &rope, eps, off).0;
@@ -507,6 +554,9 @@ impl Model {
         let (logp, mut dx, _) = self.head(&x, targets, Some(weights));
         drop(x);
         for li in (0..self.blocks.len()).rev() {
+            if stop() {
+                return None;
+            }
             let cache = if self.checkpointing {
                 let input = inputs.pop().unwrap();
                 self.blocks[li].forward(&input, t, &rope, eps, off).1
@@ -515,7 +565,7 @@ impl Model {
             };
             dx = self.blocks[li].backward(cache, &dx, t, &rope, off);
         }
-        logp
+        Some(logp)
     }
 
     /// Mean negative log-likelihood of `targets` (convenience for eval).

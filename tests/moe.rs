@@ -139,17 +139,20 @@ fn labels_define_the_experts() {
     }
 }
 
-/// Device that overheats once, after `heat_at` reads.
-struct HotOnce {
-    calls: usize,
-    heat_at: usize,
+/// Device that overheats once the general expert has been saved, a little way
+/// into the next expert (as a phone heating up during a long night).
+struct HotAfterGeneral {
+    general_meta: std::path::PathBuf,
+    since: usize,
     hot: bool,
 }
-impl DeviceMonitor for HotOnce {
+impl DeviceMonitor for HotAfterGeneral {
     fn state(&mut self) -> io::Result<DeviceState> {
-        self.calls += 1;
-        if self.calls == self.heat_at {
-            self.hot = true;
+        if self.general_meta.exists() {
+            self.since += 1;
+            if self.since == 40 {
+                self.hot = true;
+            }
         }
         let mut s = ok_state();
         if self.hot {
@@ -171,8 +174,8 @@ fn overnight_mixture_trains_routes_gates_and_resumes() {
 
     // Night 1: overheats during the second expert and the deadline passes → deferred.
     let mut m = model();
-    // The general expert (108 examples × 2 epochs ≈ 220 reads) finishes; a skill expert is cut off.
-    let mut mon = HotOnce { calls: 0, heat_at: 260, hot: false };
+    let general_meta = reg.work_dir().join("moe/bundle/experts/general/trainer_meta.json");
+    let mut mon = HotAfterGeneral { general_meta, since: 0, hot: false };
     let mut give_up = || false;
     let out = run_overnight_moe(
         &mut m,

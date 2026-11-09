@@ -90,7 +90,14 @@ impl TrainData {
 
 /// Asked before every example whether training may continue.
 pub trait Control {
+    /// Asked before every example.
     fn should_continue(&mut self) -> bool;
+    /// Asked between layers *inside* an example (forward and backward pass), so a
+    /// long example can be abandoned as soon as conditions change. Defaults to
+    /// [`Control::should_continue`].
+    fn should_continue_within(&mut self) -> bool {
+        self.should_continue()
+    }
 }
 
 /// Never pauses.
@@ -104,6 +111,9 @@ impl Control for RunToEnd {
 /// Pauses after a fixed number of examples (tests, and time-boxed runs).
 pub struct StopAfter(pub usize);
 impl Control for StopAfter {
+    fn should_continue_within(&mut self) -> bool {
+        true // counts whole examples only
+    }
     fn should_continue(&mut self) -> bool {
         if self.0 == 0 {
             return false;
@@ -236,14 +246,16 @@ impl<'m> Trainer<'m> {
     }
 
     /// Accumulate the gradient of one example; returns its loss contribution.
-    fn example_grad(&mut self, idx: usize, batch_tokens: usize, batch_n: usize) -> f32 {
+    /// Accumulate one example's gradient; `None` if `ctl` stopped it mid-way.
+    fn example_grad(&mut self, idx: usize, batch_tokens: usize, batch_n: usize, ctl: &mut dyn Control) -> Option<f32> {
+        let mut stop = || !ctl.should_continue_within();
         match &self.data {
             TrainData::Sft(v) => {
                 let ex = &v[idx];
                 let targets: Vec<Target> = answer_targets(&ex.tokens, ex.answer_start);
                 let w = vec![1.0 / batch_tokens as f32; targets.len()];
-                let lp = self.model.forward_backward(&ex.tokens, &targets, &w);
-                -lp.iter().sum::<f32>() / batch_tokens as f32
+                let lp = self.model.forward_backward_until(&ex.tokens, &targets, &w, &mut stop)?;
+                Some(-lp.iter().sum::<f32>() / batch_tokens as f32)
             }
             TrainData::Pref(pairs) => {
                 let Objective::Dpo { beta } = self.cfg.objective else { unreachable!() };
@@ -257,10 +269,10 @@ impl<'m> Trainer<'m> {
                 for (ex, coef) in [(&p.chosen, c), (&p.rejected, -c)] {
                     let targets = answer_targets(&ex.tokens, ex.answer_start);
                     let w = vec![coef; targets.len()];
-                    self.model.forward_backward(&ex.tokens, &targets, &w);
+                    self.model.forward_backward_until(&ex.tokens, &targets, &w, &mut stop)?;
                 }
                 // -log σ(z) = softplus(-z)
-                crate::tensor::softplus(-z) / batch_n as f32
+                Some(crate::tensor::softplus(-z) / batch_n as f32)
             }
         }
     }
@@ -306,7 +318,13 @@ impl<'m> Trainer<'m> {
                     paused = true;
                     break;
                 }
-                loss += self.example_grad(i, batch_tokens, batch.len());
+                match self.example_grad(i, batch_tokens, batch.len(), ctl) {
+                    Some(l) => loss += l,
+                    None => {
+                        paused = true;
+                        break;
+                    }
+                }
             }
             if paused {
                 self.model.zero_grad();

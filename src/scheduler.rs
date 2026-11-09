@@ -12,9 +12,9 @@
 //! transition is written to the registry ledger.
 
 use crate::adapter::{base_fingerprint, save_adapter, AdapterMeta};
-use crate::eval::{gate, measure, measure_sums, EvalReport, GateConfig, Sums};
+use crate::eval::{gate, measure_sums_paced, EvalReport, GateConfig, Sums};
 use crate::model::Model;
-use crate::moe::{measure_current, prompt_of, select_expert, Current, MoeConfig, GENERAL};
+use crate::moe::{measure_current_paced, prompt_of, select_expert, Current, MoeConfig, GENERAL};
 use crate::registry::{now_unix, Registry};
 use crate::tokenizer::Example;
 use crate::train::{Control, PrefPair, StopReason, TrainConfig, TrainData, Trainer};
@@ -188,6 +188,43 @@ pub struct Heldout<'a> {
     pub pref: &'a [PrefPair],
 }
 
+/// Holds held-out evaluation to the same power policy as training: before each
+/// evaluation example it checks the device, waiting (cool-down, charger) when
+/// needed. `pace()` returns `false` once the deadline passes.
+struct Pacer<'a> {
+    monitor: &'a mut dyn DeviceMonitor,
+    policy: &'a PowerPolicy,
+    wait: &'a mut dyn FnMut() -> bool,
+    work: &'a Path,
+    running: bool,
+    last_reason: String,
+}
+
+impl Pacer<'_> {
+    fn pace(&mut self) -> bool {
+        loop {
+            let r = match self.monitor.state() {
+                Ok(s) => self.policy.check(&s, self.running),
+                Err(e) => Err(format!("device state unavailable: {e}")),
+            };
+            match r {
+                Ok(()) => {
+                    self.running = true;
+                    return true;
+                }
+                Err(reason) => {
+                    self.running = false;
+                    write_status(self.work, "waiting (evaluation)", 0, 0, Some(reason.clone()));
+                    self.last_reason = reason;
+                    if !(self.wait)() {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Train until finished, pausing and resuming with the device state.
 /// Returns `Some(reason)` if the deadline passed first (checkpoint saved, ledger `deferred`).
 fn drive(
@@ -327,9 +364,22 @@ pub fn run_overnight(
     save_adapter(model, &cand_dir, &meta)?;
 
     // Eval gate: candidate vs current (base + active adapter, or base alone).
-    let (cand, tokens) = measure(model, heldout.sft, heldout.pref);
     let current_cfg = crate::moe::Current::from_dir(registry.active_dir())?;
-    let current = crate::moe::measure_current(model, &current_cfg, heldout.sft, heldout.pref)?.metrics();
+    let mut pacer = Pacer { monitor, policy: &job.power, wait, work: &work, running: false, last_reason: String::new() };
+    let sums = measure_sums_paced(model, heldout.sft, heldout.pref, &mut || pacer.pace());
+    let cur_sums = match sums {
+        Some(_) => measure_current_paced(model, &current_cfg, heldout.sft, heldout.pref, &mut || pacer.pace())?,
+        None => None,
+    };
+    let (Some(cand_sums), Some(cur_sums)) = (sums, cur_sums) else {
+        // Deadline during evaluation: drop the unevaluated candidate but keep the
+        // finished checkpoint, so the next night goes straight to evaluation.
+        let _ = std::fs::remove_dir_all(&cand_dir);
+        let reason = pacer.last_reason.clone();
+        registry.ledger("deferred", None, serde_json::json!({"reason": reason, "phase": "evaluating", "step": steps}))?;
+        return Ok(Outcome::Deferred { reason, step: steps, total_steps: steps });
+    };
+    let (cand, tokens, current) = (cand_sums.metrics(), cand_sums.tokens, cur_sums.metrics());
     let report = gate(&job.gate, &current, &cand, heldout.sft.len() + heldout.pref.len(), tokens);
     let detail = serde_json::to_value(&report)?;
     meta.eval = Some(detail.clone());
@@ -518,16 +568,32 @@ pub fn run_overnight_moe(
             None => unsure.1.push(p.clone()),
         }
     }
+    let mut pacer = Pacer { monitor, policy: &job.power, wait, work: &root, running: false, last_reason: String::new() };
+    // Evaluation follows the power policy; on the deadline, keep the trained experts
+    // (the work dir survives) so the next night goes straight to evaluation.
+    macro_rules! paced {
+        ($e:expr) => {
+            match $e {
+                Some(v) => v,
+                None => {
+                    model.set_lora_enabled(true);
+                    let reason = pacer.last_reason.clone();
+                    registry.ledger("deferred", None, serde_json::json!({"reason": reason, "phase": "evaluating", "kind": "moe"}))?;
+                    return Ok(Outcome::Deferred { reason, step: 0, total_steps: 0 });
+                }
+            }
+        };
+    }
     let mut cand = Sums::default();
     let mut experts_report = Vec::new();
     for (gi, g) in plan.groups.iter().enumerate() {
         let (s, p) = &by_group[gi];
         let n_held = s.len() + p.len();
         select_expert(model, &bundle, fallback.as_deref())?;
-        let fb = measure_sums(model, s, p);
+        let fb = paced!(measure_sums_paced(model, s, p, &mut || pacer.pace()));
         let (kept, ex_nll, chosen) = if g.has_expert {
             select_expert(model, &bundle, Some(&g.name))?;
-            let es = measure_sums(model, s, p);
+            let es = paced!(measure_sums_paced(model, s, p, &mut || pacer.pace()));
             // Keep the expert unless it is measurably worse on its own requests.
             let keep = n_held == 0 || es.metrics().nll <= fb.metrics().nll;
             (keep, (n_held > 0).then(|| es.metrics().nll), if keep { es } else { fb })
@@ -548,11 +614,11 @@ pub fn run_overnight_moe(
         });
     }
     select_expert(model, &bundle, fallback.as_deref())?;
-    cand.add(&measure_sums(model, &unsure.0, &unsure.1));
+    cand.add(&paced!(measure_sums_paced(model, &unsure.0, &unsure.1, &mut || pacer.pace())));
     model.set_lora_enabled(true);
 
     let current_cfg = Current::from_dir(registry.active_dir())?;
-    let current = measure_current(model, &current_cfg, heldout.sft, heldout.pref)?;
+    let current = paced!(measure_current_paced(model, &current_cfg, heldout.sft, heldout.pref, &mut || pacer.pace())?);
     let mut report = gate(&job.gate, &current.metrics(), &cand.metrics(), heldout.sft.len() + heldout.pref.len(), cand.tokens);
     if !router.experts.iter().any(|e| e.is_some()) && report.accepted {
         report.reason = format!("{} (no skill expert beat the fallback; bundle reduces to the general expert)", report.reason);

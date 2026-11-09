@@ -74,8 +74,17 @@ impl Sums {
 
 /// Totals for the model as currently configured (adapters on or off as set).
 pub fn measure_sums(model: &Model, sft: &[Example], pref: &[PrefPair]) -> Sums {
+    measure_sums_paced(model, sft, pref, &mut || true).expect("never stopped")
+}
+
+/// [`measure_sums`] that calls `pace` before every example; `pace` may block
+/// (e.g. while the phone cools down) and returns `false` to give up (`None`).
+pub fn measure_sums_paced(model: &Model, sft: &[Example], pref: &[PrefPair], pace: &mut dyn FnMut() -> bool) -> Option<Sums> {
     let mut s = Sums::default();
     for ex in sft {
+        if !pace() {
+            return None;
+        }
         let targets = answer_targets(&ex.tokens, ex.answer_start);
         if targets.is_empty() {
             continue;
@@ -86,13 +95,16 @@ pub fn measure_sums(model: &Model, sft: &[Example], pref: &[PrefPair]) -> Sums {
         s.tokens += targets.len();
     }
     for p in pref {
+        if !pace() {
+            return None;
+        }
         let sc = |e: &Example| model.logprobs(&e.tokens, &answer_targets(&e.tokens, e.answer_start)).iter().sum::<f32>();
         if sc(&p.chosen) > sc(&p.rejected) {
             s.pref_wins += 1;
         }
         s.pref_n += 1;
     }
-    s
+    Some(s)
 }
 
 /// Measure the model as currently configured (adapters on or off as set).
@@ -135,4 +147,28 @@ pub fn evaluate_vs_base(model: &mut Model, cfg: &GateConfig, sft: &[Example], pr
     model.set_lora_enabled(true);
     let (cand, _) = measure(model, sft, pref);
     gate(cfg, &cur, &cand, sft.len() + pref.len(), tokens)
+}
+
+/// Length of the answer prefix that greedy decoding reproduces exactly, and the
+/// answer length. Greedy decoding emits the whole target iff the argmax is right at
+/// every answer position under teacher forcing (induction on the prefix), so this
+/// gives exact greedy exact-match from one forward pass.
+pub fn greedy_prefix(model: &Model, ex: &Example) -> (usize, usize) {
+    let start = ex.answer_start.max(1);
+    if start >= ex.tokens.len() {
+        return (0, 0);
+    }
+    let positions: Vec<usize> = (start - 1..ex.tokens.len() - 1).collect();
+    let v = model.cfg.vocab_size;
+    let logits = model.logits_at(&ex.tokens, &positions);
+    let mut ok = 0;
+    for (i, _) in positions.iter().enumerate() {
+        let row = &logits[i * v..(i + 1) * v];
+        let arg = (0..v).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32;
+        if arg != ex.tokens[start + i] {
+            break;
+        }
+        ok += 1;
+    }
+    (ok, positions.len())
 }

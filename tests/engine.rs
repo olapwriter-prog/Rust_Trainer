@@ -275,3 +275,20 @@ fn f16_rounding_matches_engine_kv_cache() {
         assert_eq!(rust_trainer::attention::round_f16(*x), fp16_to_f32(*hb), "x = {x:e}");
     }
 }
+
+/// Same bit-exactness check on a real GGUF model. Opt-in (needs a file):
+/// `RT_GGUF=qwen3-0.6b-q4_0.gguf cargo test --release --test engine real_model -- --ignored`
+#[test]
+#[ignore]
+fn real_model_logits_match_engine() {
+    let Ok(path) = std::env::var("RT_GGUF") else { return };
+    let file = Arc::new(GgufFile::open(&path).unwrap());
+    let gm = load_gguf_from(file.clone(), &opts()).unwrap();
+    let tokens = gm.tokenizer.encode("<|im_start|>user\nturn on the lamp in the kitchen<|im_end|>\n<|im_start|>assistant\n", true, true);
+    let (ref_logits, nv) = engine_logits(&file, &tokens);
+    let positions: Vec<usize> = (0..tokens.len()).collect();
+    let ours = gm.model.logits_at(&tokens, &positions);
+    let worst = ours[..tokens.len() * nv].iter().zip(&ref_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    eprintln!("{path}: {} tokens × vocab {nv} logits, max |Δ| = {worst:e}", tokens.len());
+    assert_eq!(worst, 0.0);
+}
