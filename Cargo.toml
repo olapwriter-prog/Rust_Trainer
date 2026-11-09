@@ -40,3 +40,7 @@ default = ["rie"]
 rie = ["dep:rie-core"]
 # Load a Hugging Face tokenizer.json (Qwen BPE) for training on raw text.
 hf-tokenizers = ["dep:tokenizers"]
+
+[[example]]
+name = "bench_train"
+required-features = ["rie"]

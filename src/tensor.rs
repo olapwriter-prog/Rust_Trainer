@@ -66,17 +66,15 @@ pub fn matmul_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
     if n == 0 {
         return out;
     }
-    out.par_chunks_mut(n * ROW_CHUNK)
-        .enumerate()
-        .for_each(|(ci, oc)| {
-            for (ri, orow) in oc.chunks_mut(n).enumerate() {
-                let i = ci * ROW_CHUNK + ri;
-                let arow = &a[i * k..(i + 1) * k];
-                for (j, o) in orow.iter_mut().enumerate() {
-                    *o = dot(arow, &b[j * k..(j + 1) * k]);
-                }
+    out.par_chunks_mut(n * ROW_CHUNK).enumerate().for_each(|(ci, oc)| {
+        for (ri, orow) in oc.chunks_mut(n).enumerate() {
+            let i = ci * ROW_CHUNK + ri;
+            let arow = &a[i * k..(i + 1) * k];
+            for (j, o) in orow.iter_mut().enumerate() {
+                *o = dot(arow, &b[j * k..(j + 1) * k]);
             }
-        });
+        }
+    });
     out
 }
 
@@ -88,19 +86,17 @@ pub fn matmul_nn(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32>
     if n == 0 {
         return out;
     }
-    out.par_chunks_mut(n * ROW_CHUNK)
-        .enumerate()
-        .for_each(|(ci, oc)| {
-            for (ri, orow) in oc.chunks_mut(n).enumerate() {
-                let i = ci * ROW_CHUNK + ri;
-                for p in 0..k {
-                    let av = a[i * k + p];
-                    if av != 0.0 {
-                        axpy(av, &b[p * n..(p + 1) * n], orow);
-                    }
+    out.par_chunks_mut(n * ROW_CHUNK).enumerate().for_each(|(ci, oc)| {
+        for (ri, orow) in oc.chunks_mut(n).enumerate() {
+            let i = ci * ROW_CHUNK + ri;
+            for p in 0..k {
+                let av = a[i * k + p];
+                if av != 0.0 {
+                    axpy(av, &b[p * n..(p + 1) * n], orow);
                 }
             }
-        });
+        }
+    });
     out
 }
 

@@ -18,7 +18,7 @@
 //!   LoRA GGUF (`general.type = adapter`, `adapter.type = lora`,
 //!   `blk.N.attn_q.weight.lora_a/lora_b`) with the engine's own GGUF writer.
 
-use crate::attention::{AttnConfig, Attention};
+use crate::attention::{Attention, AttnConfig};
 use crate::data::Text;
 use crate::frozen::{Frozen, FrozenMatmul};
 use crate::linear::{Linear, Lora};
@@ -166,10 +166,7 @@ pub fn load_gguf_from(file: Arc<GgufFile>, opts: &GgufOptions) -> io::Result<Ggu
     let rm = rie_core::model::Model::load(file.clone()).map_err(io_err)?;
     let c = &rm.cfg;
     if !trainable_arch(c.arch) {
-        return Err(io_err(format!(
-            "architecture '{}' is not trainable yet (supported: llama, mistral, qwen2, qwen3)",
-            c.arch_name
-        )));
+        return Err(io_err(format!("architecture '{}' is not trainable yet (supported: llama, mistral, qwen2, qwen3)", c.arch_name)));
     }
     let plain = c.embd_scale == 1.0
         && c.residual_scale == 1.0
@@ -296,11 +293,8 @@ impl EngineChat {
             ChatTemplate::Granite => Some("<|end_of_text|>"),
             ChatTemplate::Mistral | ChatTemplate::Raw => None,
         };
-        let end_token = named
-            .and_then(|n| tok.token_id(n))
-            .or(tok.eot)
-            .or(tok.eos)
-            .ok_or_else(|| io_err("tokenizer has no end-of-turn token"))?;
+        let end_token =
+            named.and_then(|n| tok.token_id(n)).or(tok.eot).or(tok.eos).ok_or_else(|| io_err("tokenizer has no end-of-turn token"))?;
         Ok(EngineChat { tok, template, end_token, max_len })
     }
 

@@ -6,7 +6,7 @@
 //! [`crate::frozen::FrozenMatmul`]; this loader is for the Mac/VM path and for
 //! verifying numerics against the reference implementation.
 
-use crate::attention::{AttnConfig, Attention};
+use crate::attention::{Attention, AttnConfig};
 use crate::deltanet::{DeltaNet, DeltaNetConfig};
 use crate::frozen::{Frozen, FrozenWeight};
 use crate::linear::Linear;
@@ -31,12 +31,7 @@ fn get_f32_or(v: &Value, k: &str, d: f32) -> f32 {
 /// Parse `config.json` into a [`ModelConfig`].
 pub fn parse_config(root: &Value) -> io::Result<ModelConfig> {
     let tc = root.get("text_config").unwrap_or(root);
-    let model_type = tc
-        .get("model_type")
-        .or_else(|| root.get("model_type"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let model_type = tc.get("model_type").or_else(|| root.get("model_type")).and_then(Value::as_str).unwrap_or("").to_string();
     let hidden = get_usize(tc, "hidden_size")?;
     let n_layers = get_usize(tc, "num_hidden_layers")?;
     let n_heads = get_usize(tc, "num_attention_heads")?;
@@ -48,11 +43,7 @@ pub fn parse_config(root: &Value) -> io::Result<ModelConfig> {
         .and_then(Value::as_f64)
         .or_else(|| rope_params.and_then(|r| r.get("rope_theta")).and_then(Value::as_f64))
         .unwrap_or(1_000_000.0) as f32;
-    let tie = root
-        .get("tie_word_embeddings")
-        .or_else(|| tc.get("tie_word_embeddings"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let tie = root.get("tie_word_embeddings").or_else(|| tc.get("tie_word_embeddings")).and_then(Value::as_bool).unwrap_or(false);
     let vocab = get_usize(tc, "vocab_size")?;
     let eps = get_f32_or(tc, "rms_norm_eps", 1e-6);
     let inter = get_usize(tc, "intermediate_size")?;
@@ -74,9 +65,7 @@ pub fn parse_config(root: &Value) -> io::Result<ModelConfig> {
                 .collect::<io::Result<_>>()?,
             None => {
                 let every = tc.get("full_attention_interval").and_then(Value::as_u64).unwrap_or(4) as usize;
-                (0..n_layers)
-                    .map(|i| if (i + 1) % every == 0 { LayerKind::FullAttention } else { LayerKind::LinearAttention })
-                    .collect()
+                (0..n_layers).map(|i| if (i + 1) % every == 0 { LayerKind::FullAttention } else { LayerKind::LinearAttention }).collect()
             }
         };
         let prf = tc

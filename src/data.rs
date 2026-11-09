@@ -60,10 +60,7 @@ fn is_confirmed(v: &Value) -> bool {
     if v.get("confirmed").and_then(Value::as_bool) == Some(true) {
         return true;
     }
-    matches!(
-        v.get("status").and_then(Value::as_str),
-        Some("confirmed") | Some("approved") | Some("corrected")
-    )
+    matches!(v.get("status").and_then(Value::as_str), Some("confirmed") | Some("approved") | Some("corrected"))
 }
 
 fn text_field(v: &Value, names: &[&str]) -> Option<Text> {
@@ -100,11 +97,7 @@ fn from_messages(v: &Value) -> Option<(Option<String>, Text, Text)> {
             turns.push((role.to_string(), content.to_string()));
         }
     }
-    let prompt = if turns.len() == 1 && turns[0].0 == "user" {
-        Text::Str(turns[0].1.clone())
-    } else {
-        Text::Turns(turns)
-    };
+    let prompt = if turns.len() == 1 && turns[0].0 == "user" { Text::Str(turns[0].1.clone()) } else { Text::Turns(turns) };
     Some((system, prompt, Text::Str(answer)))
 }
 
@@ -130,10 +123,8 @@ impl Dataset {
             self.dropped_unconfirmed += 1;
             return;
         }
-        let id = v
-            .get("id")
-            .map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()))
-            .unwrap_or_else(|| format!("line{ln}"));
+        let id =
+            v.get("id").map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).unwrap_or_else(|| format!("line{ln}"));
         let split = v.get("split").and_then(Value::as_str).map(str::to_string);
         let mut system = v.get("system").and_then(Value::as_str).map(str::to_string);
         let prompt = text_field(v, &["prompt", "input", "request"]);
@@ -173,10 +164,18 @@ impl Dataset {
         let mut train = Dataset::default();
         let mut held = Dataset::default();
         for r in &self.sft {
-            if is_held(&r.id, &r.split) { held.sft.push(r.clone()) } else { train.sft.push(r.clone()) }
+            if is_held(&r.id, &r.split) {
+                held.sft.push(r.clone())
+            } else {
+                train.sft.push(r.clone())
+            }
         }
         for r in &self.pref {
-            if is_held(&r.id, &r.split) { held.pref.push(r.clone()) } else { train.pref.push(r.clone()) }
+            if is_held(&r.id, &r.split) {
+                held.pref.push(r.clone())
+            } else {
+                train.pref.push(r.clone())
+            }
         }
         (train, held)
     }

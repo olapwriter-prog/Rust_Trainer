@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  x86_64:
+    name: x86_64 tests (AVX2 + scalar engine kernels)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo test
+      - name: engine scalar fallback kernels (forward must stay bit-exact)
+        run: cargo test --test engine
+        env:
+          RIE_DISABLE: simd
+      - name: without the engine (HF safetensors path only)
+        run: cargo test --no-default-features
+      - name: CLI end to end on a synthetic GGUF
+        run: |
+          cargo build --release
+          B=target/release/rust_trainer
+          $B synth --arch qwen3 --wtype Q4_0 --out m.gguf
+          python3 -c "import json;[print(json.dumps({'id':f'r{i}','prompt':f'the {i}','response':f'{i} the!','confirmed':True})) for i in range(60)]" > data.jsonl
+          echo '{"stage":"deep","charging":true,"battery_pct":80,"temp_c":30}' > dev.json
+          $B run --model m.gguf --data data.jsonl --status dev.json --threads 2 --no-pin --epochs 3 --batch 8 --lr 4e-3 --rank 4 --min-train 20 --heldout 0.2 --hours 0.05 | tee out.json
+          grep -q '"outcome": "accepted"' out.json
+          test -f m.adapters/$(cat m.adapters/ACTIVE)/adapter.gguf
+          $B status --model m.gguf
+          $B rollback --model m.gguf --reason ci
+
+  aarch64:
+    name: AArch64 NEON / dotprod / i8mm (QEMU) — bit-exact with the engine
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: i8mm + dotprod (Armv8.6+)
+        run: cargo test --target aarch64-unknown-linux-gnu --test engine --test gradcheck
+      - name: dotprod only (Armv8.2-8.5)
+        run: cargo test --target aarch64-unknown-linux-gnu --test engine
+        env:
+          RIE_DISABLE: i8mm
+      - name: baseline NEON on Cortex-A53
+        run: cargo test --target aarch64-unknown-linux-gnu --test engine
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -cpu cortex-a53 -L /usr/aarch64-linux-gnu
+
+  mobile:
+    name: Android / iOS build check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android, aarch64-apple-ios
+      - run: cargo check --target aarch64-linux-android
+      - run: cargo check --target x86_64-linux-android
+      - run: cargo check --target aarch64-apple-ios

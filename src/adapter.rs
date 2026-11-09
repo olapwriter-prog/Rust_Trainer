@@ -166,11 +166,13 @@ pub fn load_adapter_into(model: &mut Model, dir: impl AsRef<Path>) -> io::Result
     Ok(meta)
 }
 
+/// One adapted module: A `[r×in]`, B `[out×r]`, r, in, out.
+pub type LoraModule = (Vec<f32>, Vec<f32>, usize, usize, usize);
+
 /// Standalone adapter for an inference engine: `y += (α/r)·B·(A·x)` per module.
 pub struct LoraAdapter {
     pub scale: f32,
-    /// module name → (A `[r×in]`, B `[out×r]`, r, in, out)
-    pub modules: HashMap<String, (Vec<f32>, Vec<f32>, usize, usize, usize)>,
+    pub modules: HashMap<String, LoraModule>,
 }
 
 impl LoraAdapter {

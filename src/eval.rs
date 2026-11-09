@@ -98,15 +98,7 @@ pub fn gate(cfg: &GateConfig, current: &Metrics, candidate: &Metrics, examples: 
     } else {
         (true, format!("NLL −{:.2}%", rel * 100.0))
     };
-    EvalReport {
-        examples,
-        tokens,
-        current: current.clone(),
-        candidate: candidate.clone(),
-        rel_improvement: rel,
-        accepted,
-        reason,
-    }
+    EvalReport { examples, tokens, current: current.clone(), candidate: candidate.clone(), rel_improvement: rel, accepted, reason }
 }
 
 /// Convenience: evaluate one model with its adapters off (= current base) and on (= candidate).

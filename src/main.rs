@@ -8,6 +8,7 @@
 //! rust_trainer run      --model DIR --data FILE --status FILE [--hours H] [--poll-secs S] [options]
 //! rust_trainer rollback --model DIR [--reason TEXT]
 //! rust_trainer status   --model DIR
+//! rust_trainer synth    --out FILE.gguf [--arch qwen3 | --preset qwen3-0.6b] [--wtype Q4_0]
 //! ```
 //! Options: `--rank 8 --alpha 16 --lr 2e-4 --epochs 2 --batch 4 --max-len 512
 //! --heldout 0.1 --dpo BETA --q8 --tokenizer FILE --assistant-prefix TEXT
@@ -20,7 +21,7 @@ use rust_trainer::hf::{estimate, load_model, LoadOptions};
 use rust_trainer::model::{Model, ModelConfig, DEFAULT_TARGETS};
 use rust_trainer::registry::{now_unix, Registry};
 use rust_trainer::scheduler::{run_overnight, FileMonitor, Heldout, JobConfig, PowerPolicy};
-use rust_trainer::tokenizer::{ByteTokenizer, ChatFormat, Example, Tokenizer};
+use rust_trainer::tokenizer::{ByteTokenizer, ChatFormat, ChatMl, Example, Formatter, Tokenizer};
 use rust_trainer::train::{Objective, PrefPair, RunToEnd, TrainConfig, TrainData, Trainer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -72,7 +73,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: rust_trainer <toy|info|train|eval|run|rollback|status> [--options]  (see README.md)".to_string()
+    "usage: rust_trainer <toy|info|train|eval|run|rollback|status|synth> [--options]  (see README.md)".to_string()
 }
 
 fn main() -> ExitCode {
@@ -91,6 +92,8 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args),
         "rollback" => cmd_rollback(&args),
         "status" => cmd_status(&args),
+        #[cfg(feature = "rie")]
+        "synth" => cmd_synth(&args),
         _ => Err(usage()),
     };
     match r {
@@ -131,9 +134,38 @@ fn gate_config(a: &Args) -> Result<GateConfig, String> {
     })
 }
 
-fn load(a: &Args) -> Result<Model, String> {
-    let dir = a.req("model")?;
-    let mut m = load_model(dir, &LoadOptions { quantize_q8: a.flag("q8") }).map_err(|e| format!("loading {dir}: {e}"))?;
+/// A loaded base model, plus the engine's tokenizer and chat template for GGUF models.
+struct Loaded {
+    model: Model,
+    #[cfg(feature = "rie")]
+    engine: Option<(std::sync::Arc<rust_trainer::rie::rie_core::Tokenizer>, rust_trainer::rie::rie_core::chat::ChatTemplate)>,
+}
+
+fn is_gguf(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".gguf")
+}
+
+fn load(a: &Args) -> Result<Loaded, String> {
+    let path = a.req("model")?;
+    if is_gguf(path) {
+        #[cfg(feature = "rie")]
+        {
+            let opts =
+                rust_trainer::rie::GgufOptions { n_threads: a.get("threads").and_then(|t| t.parse().ok()), pin_threads: !a.flag("no-pin") };
+            let gm = rust_trainer::rie::load_gguf(path, &opts).map_err(|e| format!("loading {path}: {e}"))?;
+            let template = match a.get("template") {
+                Some(name) => {
+                    rust_trainer::rie::rie_core::chat::ChatTemplate::from_name(name).ok_or_else(|| format!("unknown --template {name}"))?
+                }
+                None => gm.template,
+            };
+            eprintln!("model: {} via rie-core ({:?} template)", gm.arch_name, template);
+            return Ok(Loaded { model: gm.model, engine: Some((gm.tokenizer, template)) });
+        }
+        #[cfg(not(feature = "rie"))]
+        return Err("GGUF models need the `rie` feature".into());
+    }
+    let mut m = load_model(path, &LoadOptions { quantize_q8: a.flag("q8") }).map_err(|e| format!("loading {path}: {e}"))?;
     if let Some(c) = a.get("bptt-chunk") {
         let c: usize = c.parse().map_err(|_| "--bptt-chunk")?;
         for b in &mut m.blocks {
@@ -142,7 +174,11 @@ fn load(a: &Args) -> Result<Model, String> {
             }
         }
     }
-    Ok(m)
+    Ok(Loaded {
+        model: m,
+        #[cfg(feature = "rie")]
+        engine: None,
+    })
 }
 
 /// Raw-text data needs a tokenizer; pre-tokenised (`*_ids`) data does not.
@@ -157,10 +193,7 @@ fn tokenizer(a: &Args) -> Result<Option<Box<dyn Tokenizer>>, String> {
         Some(p) => Ok(Some(Box::new(rust_trainer::tokenizer::HfTokenizer::from_file(&p)?))),
         #[cfg(not(feature = "hf-tokenizers"))]
         Some(p) => {
-            eprintln!(
-                "note: {} found but built without the `hf-tokenizers` feature; only pre-tokenised data can be used",
-                p.display()
-            );
+            eprintln!("note: {} found but built without the `hf-tokenizers` feature; only pre-tokenised data can be used", p.display());
             Ok(None)
         }
     }
@@ -170,41 +203,24 @@ fn needs_tokenizer(t: &Text) -> bool {
     !matches!(t, Text::Ids(_))
 }
 
-fn build_examples(
-    ds: &Dataset,
-    tok: Option<&dyn Tokenizer>,
-    prefix: &str,
-    max_len: usize,
-) -> Result<(Vec<Example>, Vec<PrefPair>), String> {
-    let any_text = ds.sft.iter().any(|r| needs_tokenizer(&r.prompt) || needs_tokenizer(&r.response))
-        || ds.pref.iter().any(|r| needs_tokenizer(&r.prompt) || needs_tokenizer(&r.chosen) || needs_tokenizer(&r.rejected));
-    let byte = ByteTokenizer;
-    let tok: &dyn Tokenizer = match tok {
-        Some(t) => t,
-        None if any_text => {
-            return Err("data contains raw text: pass --tokenizer tokenizer.json (build with --features hf-tokenizers) or export *_ids".into())
-        }
-        None => &byte, // only used for the ChatML special ids, which pre-tokenised data never needs
-    };
-    let fmt = ChatFormat::qwen(tok, prefix, max_len).or_else(|e| {
-        if any_text { Err(e) } else { ChatFormat::qwen(&byte, prefix, max_len) }
-    })?;
-    let sft = ds
-        .sft
-        .iter()
-        .filter_map(|r| fmt.example(tok, r.system.as_deref(), &r.prompt, &r.response))
-        .collect();
+fn any_raw_text(ds: &Dataset) -> bool {
+    ds.sft.iter().any(|r| needs_tokenizer(&r.prompt) || needs_tokenizer(&r.response))
+        || ds.pref.iter().any(|r| needs_tokenizer(&r.prompt) || needs_tokenizer(&r.chosen) || needs_tokenizer(&r.rejected))
+}
+
+fn build_examples(ds: &Dataset, fmt: &dyn Formatter) -> (Vec<Example>, Vec<PrefPair>) {
+    let sft = ds.sft.iter().filter_map(|r| fmt.example(r.system.as_deref(), &r.prompt, &r.response)).collect();
     let pref = ds
         .pref
         .iter()
         .filter_map(|r| {
             Some(PrefPair {
-                chosen: fmt.example(tok, r.system.as_deref(), &r.prompt, &r.chosen)?,
-                rejected: fmt.example(tok, r.system.as_deref(), &r.prompt, &r.rejected)?,
+                chosen: fmt.example(r.system.as_deref(), &r.prompt, &r.chosen)?,
+                rejected: fmt.example(r.system.as_deref(), &r.prompt, &r.rejected)?,
             })
         })
         .collect();
-    Ok((sft, pref))
+    (sft, pref)
 }
 
 fn default_prefix(m: &Model) -> &'static str {
@@ -222,7 +238,8 @@ struct Prepared {
     n_train: usize,
 }
 
-fn prepare(a: &Args, model: &Model, cfg: &TrainConfig) -> Result<Prepared, String> {
+fn prepare(a: &Args, loaded: &Loaded, cfg: &TrainConfig) -> Result<Prepared, String> {
+    let model = &loaded.model;
     let path = a.req("data")?;
     let ds = Dataset::load_jsonl(path).map_err(|e| format!("{path}: {e}"))?;
     eprintln!(
@@ -233,11 +250,41 @@ fn prepare(a: &Args, model: &Model, cfg: &TrainConfig) -> Result<Prepared, Strin
         ds.dropped_malformed
     );
     let (train, held) = ds.split(a.num("heldout", 0.1)?);
-    let tok = tokenizer(a)?;
-    let prefix = a.get("assistant-prefix").map(|s| s.replace("\\n", "\n")).unwrap_or_else(|| default_prefix(model).into());
     let max_len = a.num("max-len", 512)?;
-    let (tr_sft, tr_pref) = build_examples(&train, tok.as_deref(), &prefix, max_len)?;
-    let (held_sft, held_pref) = build_examples(&held, tok.as_deref(), &prefix, max_len)?;
+    let any_text = any_raw_text(&ds);
+
+    // GGUF models: format exactly as the engine's chat() does.
+    #[cfg(feature = "rie")]
+    let engine_fmt = match &loaded.engine {
+        Some((tok, template)) => Some(rust_trainer::rie::EngineChat::new(tok.clone(), *template, max_len).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    #[cfg(not(feature = "rie"))]
+    let engine_fmt: Option<ChatMl<'static>> = None;
+
+    let tok = tokenizer(a)?;
+    let byte = ByteTokenizer;
+    let prefix = a.get("assistant-prefix").map(|s| s.replace("\\n", "\n")).unwrap_or_else(|| default_prefix(model).into());
+    let chatml;
+    let fmt: &dyn Formatter = match &engine_fmt {
+        Some(f) => f,
+        None => {
+            let t: &dyn Tokenizer = match tok.as_deref() {
+                Some(t) => t,
+                None if any_text => {
+                    return Err("data contains raw text: pass --tokenizer tokenizer.json (build with --features hf-tokenizers), use a GGUF model, or export *_ids".into())
+                }
+                None => &byte, // pre-tokenised data only needs the ChatML special ids
+            };
+            let f =
+                ChatFormat::qwen(t, &prefix, max_len)
+                    .or_else(|e| if any_text { Err(e) } else { ChatFormat::qwen(&byte, &prefix, max_len) })?;
+            chatml = ChatMl { fmt: f, tok: t };
+            &chatml
+        }
+    };
+    let (tr_sft, tr_pref) = build_examples(&train, fmt);
+    let (held_sft, held_pref) = build_examples(&held, fmt);
     for ex in tr_sft.iter().chain(&held_sft) {
         if let Some(&t) = ex.tokens.iter().find(|&&t| t as usize >= model.cfg.vocab_size) {
             return Err(format!("token id {t} exceeds the model vocab {}", model.cfg.vocab_size));
@@ -251,14 +298,31 @@ fn prepare(a: &Args, model: &Model, cfg: &TrainConfig) -> Result<Prepared, Strin
     Ok(Prepared { train, held_sft, held_pref, n_train })
 }
 
+/// Load an adapter directory: PEFT safetensors, or only `adapter.gguf` (e.g. from llama.cpp).
+fn load_adapter_dir(model: &mut Model, dir: &str) -> Result<(), String> {
+    let d = Path::new(dir);
+    if d.join(rust_trainer::adapter::WEIGHTS_FILE).exists() && d.join(rust_trainer::adapter::META_FILE).exists() {
+        return load_adapter_into(model, d).map(|_| ()).map_err(|e| e.to_string());
+    }
+    #[cfg(feature = "rie")]
+    {
+        let g = if d.is_file() { d.to_path_buf() } else { d.join(rust_trainer::rie::GGUF_ADAPTER_FILE) };
+        if g.exists() {
+            return rust_trainer::rie::read_gguf_adapter(model, &g).map(|_| ()).map_err(|e| e.to_string());
+        }
+    }
+    Err(format!("{dir}: no adapter found"))
+}
+
 fn log_line(s: &str) {
     eprintln!("{s}");
 }
 
 fn cmd_train(a: &Args) -> Result<(), String> {
-    let mut model = load(a)?;
+    let loaded = load(a)?;
     let cfg = train_config(a)?;
-    let p = prepare(a, &model, &cfg)?;
+    let p = prepare(a, &loaded, &cfg)?;
+    let mut model = loaded.model;
     if p.n_train == 0 {
         return Err("no confirmed training examples".into());
     }
@@ -296,29 +360,27 @@ fn cmd_train(a: &Args) -> Result<(), String> {
 }
 
 fn cmd_eval(a: &Args) -> Result<(), String> {
-    let mut model = load(a)?;
+    let loaded = load(a)?;
     let cfg = TrainConfig::default();
-    let p = prepare(a, &model, &cfg)?;
-    load_adapter_into(&mut model, a.req("adapter")?).map_err(|e| e.to_string())?;
+    let p = prepare(a, &loaded, &cfg)?;
+    let mut model = loaded.model;
+    load_adapter_dir(&mut model, a.req("adapter")?)?;
     let rep = evaluate_vs_base(&mut model, &gate_config(a)?, &p.held_sft, &p.held_pref);
     println!("{}", serde_json::to_string_pretty(&rep).unwrap());
     Ok(())
 }
 
 fn cmd_run(a: &Args) -> Result<(), String> {
-    let mut model = load(a)?;
+    let loaded = load(a)?;
     let train = train_config(a)?;
-    let p = prepare(a, &model, &train)?;
+    let p = prepare(a, &loaded, &train)?;
+    let mut model = loaded.model;
     let registry = Registry::open(a.req("model")?).map_err(|e| e.to_string())?;
     let job = JobConfig {
         base_model: a.req("model")?.to_string(),
         train,
         gate: gate_config(a)?,
-        power: PowerPolicy {
-            min_battery_pct: a.num("min-battery", 50.0)?,
-            max_temp_c: a.num("max-temp", 40.0)?,
-            ..Default::default()
-        },
+        power: PowerPolicy { min_battery_pct: a.num("min-battery", 50.0)?, max_temp_c: a.num("max-temp", 40.0)?, ..Default::default() },
         min_train_examples: a.num("min-train", 50)?,
     };
     let mut monitor = FileMonitor(PathBuf::from(a.req("status")?));
@@ -368,16 +430,24 @@ fn cmd_status(a: &Args) -> Result<(), String> {
 }
 
 fn cmd_info(a: &Args) -> Result<(), String> {
-    let dir = a.req("model")?;
-    let root: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(Path::new(dir).join("config.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let cfg = rust_trainer::hf::parse_config(&root).map_err(|e| e.to_string())?;
+    let path = a.req("model")?;
+    let (cfg, stored) = if is_gguf(path) {
+        let m = load(a)?.model;
+        let b = m.frozen_bytes();
+        (m.cfg, Some(b))
+    } else {
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(Path::new(path).join("config.json")).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        (rust_trainer::hf::parse_config(&root).map_err(|e| e.to_string())?, None)
+    };
     let rank = a.num("rank", 8)?;
     let e = estimate(&cfg, rank, DEFAULT_TARGETS);
     println!("arch {} | layers {} | hidden {}", cfg.arch, cfg.n_layers(), cfg.hidden_size);
     println!("base params        {:>8.2} M", e.base_params as f64 / 1e6);
+    if let Some(b) = stored {
+        println!("frozen weights     {:>8.1} MB as stored (memory-mapped, not copied)", b as f64 / 1e6);
+    }
     println!("LoRA params (r={rank}) {:>8.2} M", e.lora_params as f64 / 1e6);
     println!("adapter + AdamW    {:>8.1} MB (f32 weights, grads, 2 moments)", e.lora_params as f64 * 16.0 / 1e6);
     println!("forward  GFLOP/tok {:>8.2}", e.forward_flops_per_token / 1e9);
@@ -385,35 +455,48 @@ fn cmd_info(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Write a random-weight GGUF with the engine's synthetic-model builder
+/// (`--arch qwen3 --wtype Q4_0 --preset qwen3-0.6b --out FILE`), for VM runs without downloads.
+#[cfg(feature = "rie")]
+fn cmd_synth(a: &Args) -> Result<(), String> {
+    use rust_trainer::rie::rie_core::{quant::GgmlType, testing::SyntheticSpec};
+    let wtype = match a.get("wtype").unwrap_or("Q4_0") {
+        "F32" => GgmlType::F32,
+        "F16" => GgmlType::F16,
+        "Q8_0" => GgmlType::Q8_0,
+        "Q4_0" => GgmlType::Q4_0,
+        "Q4_K" => GgmlType::Q4_K,
+        "Q6_K" => GgmlType::Q6_K,
+        w => return Err(format!("unsupported --wtype {w}")),
+    };
+    let mut spec = match a.get("preset") {
+        Some(p) => SyntheticSpec::preset(p, wtype).ok_or_else(|| format!("unknown preset {p}; one of {:?}", SyntheticSpec::PRESETS))?,
+        None => SyntheticSpec::tiny(a.get("arch").unwrap_or("qwen3"), wtype),
+    };
+    spec.seed = a.num("seed", 1)?;
+    let out = a.req("out")?;
+    std::fs::write(out, spec.build()).map_err(|e| e.to_string())?;
+    eprintln!("wrote {out}: {} {:?}, {} layers, hidden {}", spec.arch, spec.wtype, spec.n_layer, spec.n_embd);
+    Ok(())
+}
+
 /// Self-contained demo on a random-weight model: shows the loss falling and the
 /// eval gate accepting the adapter on held-out examples.
 fn cmd_toy(a: &Args) -> Result<(), String> {
     let tok = ByteTokenizer;
-    let mut cfg = if a.get("arch") == Some("dense") {
-        ModelConfig::tiny_dense(tok.vocab_size())
-    } else {
-        ModelConfig::tiny_hybrid(tok.vocab_size())
-    };
+    let mut cfg =
+        if a.get("arch") == Some("dense") { ModelConfig::tiny_dense(tok.vocab_size()) } else { ModelConfig::tiny_hybrid(tok.vocab_size()) };
     cfg.hidden_size = 64;
     cfg.intermediate_size = 128;
     let mut model = Model::random(cfg, 7, a.flag("q8"));
     let (train, held) = toy_data();
     let fmt = ChatFormat::qwen(&tok, "", 128)?;
     let mk = |v: &[(String, String)]| -> Vec<Example> {
-        v.iter()
-            .filter_map(|(p, r)| fmt.example(&tok, None, &Text::Str(p.clone()), &Text::Str(r.clone())))
-            .collect()
+        v.iter().filter_map(|(p, r)| fmt.example(&tok, None, &Text::Str(p.clone()), &Text::Str(r.clone()))).collect()
     };
     let (tr, he) = (mk(&train), mk(&held));
-    let tc = TrainConfig {
-        rank: 8,
-        alpha: 16.0,
-        lr: 3e-3,
-        epochs: a.num("epochs", 4)?,
-        batch_size: 4,
-        warmup_steps: 5,
-        ..Default::default()
-    };
+    let tc =
+        TrainConfig { rank: 8, alpha: 16.0, lr: 3e-3, epochs: a.num("epochs", 4)?, batch_size: 4, warmup_steps: 5, ..Default::default() };
     let mut trainer = Trainer::new(&mut model, tc, TrainData::Sft(tr));
     eprintln!("toy: {} trainable params, {} steps", trainer.model.trainable_params(), trainer.state.total_steps);
     let t0 = Instant::now();
@@ -425,7 +508,9 @@ fn cmd_toy(a: &Args) -> Result<(), String> {
 }
 
 /// "Device command → structured action" pairs; held-out uses unseen devices/rooms.
-pub fn toy_data() -> (Vec<(String, String)>, Vec<(String, String)>) {
+type Pairs = Vec<(String, String)>;
+
+pub fn toy_data() -> (Pairs, Pairs) {
     let verbs = [("turn on", "on"), ("switch off", "off"), ("dim", "dim")];
     let things = ["lamp", "fan", "heater", "radio", "kettle", "tv"];
     let rooms = ["kitchen", "hall", "office", "garage"];

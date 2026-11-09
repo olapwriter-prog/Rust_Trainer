@@ -1,0 +1,22 @@
+# Cross-compilation helpers.
+#
+# Android: use cargo-ndk (`cargo ndk -t arm64-v8a build --release`), which wires up the
+# NDK clang linker. The flags below only tune code generation.
+#
+# The engine detects dotprod / i8mm / fp16 at runtime, so binaries are built for the
+# baseline ISA and still use the fastest kernels on each phone. If you ship separate
+# builds per device class you can raise the baseline, e.g.
+#   RUSTFLAGS="-C target-cpu=cortex-a76"   (Armv8.2 + dotprod, 2019+ phones)
+#   RUSTFLAGS="-C target-feature=+i8mm,+dotprod,+fp16"   (Armv8.6, 2022+ flagships)
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "target-feature=+neon"]
+
+[target.aarch64-apple-ios]
+# Apple A-series always have dotprod and fp16 (A11+); i8mm is detected at runtime.
+rustflags = ["-C", "target-feature=+neon,+dotprod,+fp16"]
+
+# Linux/aarch64 cross-testing on an x86 host (used in CI with qemu-user):
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+runner = "qemu-aarch64 -cpu max -L /usr/aarch64-linux-gnu"

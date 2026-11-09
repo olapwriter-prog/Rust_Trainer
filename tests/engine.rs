@@ -97,7 +97,8 @@ fn logits_match_engine() {
 #[test]
 fn input_gradient_matches_dense_reference() {
     let mut rng = Rng::new(9);
-    for wt in [GgmlType::F32, GgmlType::F16, GgmlType::Q8_0, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q4_K, GgmlType::Q6_K] {
+    for wt in [GgmlType::F32, GgmlType::F16, GgmlType::Q8_0, GgmlType::Q4_0, GgmlType::Q4_1, GgmlType::Q5_0, GgmlType::Q4_K, GgmlType::Q6_K]
+    {
         let file = synth("qwen2", wt, false);
         let gm = load_gguf_from(file, &opts()).unwrap();
         let lin = &gm.model.blocks[0].mlp.down_proj;
@@ -160,7 +161,11 @@ fn lora_grads_through_engine_model() {
                 let bump = |m: &mut Model, d: f32| {
                     let mut ls = m.lora_linears_mut();
                     let lo = ls[li].lora.as_mut().unwrap();
-                    if which == 0 { lo.a[idx] += d } else { lo.b[idx] += d }
+                    if which == 0 {
+                        lo.a[idx] += d
+                    } else {
+                        lo.b[idx] += d
+                    }
                 };
                 bump(&mut model, eps);
                 let lp = loss(&model);
@@ -209,7 +214,11 @@ fn train_q4_model_and_gguf_adapter_roundtrip() {
     for (i, a) in words.iter().enumerate() {
         for (j, b) in words.iter().enumerate() {
             let ex = fmt.example(None, &Text::Str(format!("{a} {b}")), &Text::Str(format!("{b} {a}!"))).unwrap();
-            if (i + j) % 5 == 0 { held.push(ex) } else { train.push(ex) }
+            if (i + j) % 5 == 0 {
+                held.push(ex)
+            } else {
+                train.push(ex)
+            }
         }
     }
     let mut model = gm.model;
@@ -258,7 +267,7 @@ fn unsupported_architectures_are_refused() {
 fn f16_rounding_matches_engine_kv_cache() {
     use rust_trainer::rie::rie_core::kernels::{f32_to_f16_slice, fp16_to_f32};
     let mut rng = Rng::new(3);
-    let mut xs: Vec<f32> = (0..20000).map(|i| rng.normal() * 10f32.powi((i % 9) as i32 - 6)).collect();
+    let mut xs: Vec<f32> = (0..20000).map(|i| rng.normal() * 10f32.powi(i % 9 - 6)).collect();
     xs.extend([0.0, -0.0, 65504.0, 1e-8, 6.1e-5, 2049.0, 2051.0]);
     let mut h = vec![0u16; xs.len()];
     f32_to_f16_slice(&xs, &mut h);

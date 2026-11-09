@@ -30,11 +30,7 @@ pub struct AdamW {
 
 /// Stable names of the trainable tensors, e.g. `model.layers.0.self_attn.q_proj.A`.
 pub fn param_names(model: &Model) -> Vec<String> {
-    model
-        .lora_linears()
-        .iter()
-        .flat_map(|l| [format!("{}.A", l.name), format!("{}.B", l.name)])
-        .collect()
+    model.lora_linears().iter().flat_map(|l| [format!("{}.A", l.name), format!("{}.B", l.name)]).collect()
 }
 
 impl AdamW {

@@ -18,10 +18,7 @@
 //! head rather than `O(T·dv·dk)`.
 
 use crate::linear::Linear;
-use crate::ops::{
-    causal_conv1d, causal_conv1d_backward, l2norm, l2norm_backward, rmsnorm, rmsnorm_backward, silu_backward,
-    silu_vec,
-};
+use crate::ops::{causal_conv1d, causal_conv1d_backward, l2norm, l2norm_backward, rmsnorm, rmsnorm_backward, silu_backward, silu_vec};
 use crate::tensor::{sigmoid, silu, silu_grad, softplus};
 use rayon::prelude::*;
 
@@ -160,32 +157,10 @@ impl<'a> HeadIo<'a> {
 }
 
 impl DeltaNet {
-    fn head_io<'a>(
-        &self,
-        t: usize,
-        h: usize,
-        q: &'a [f32],
-        k: &'a [f32],
-        v: &'a [f32],
-        beta: &'a [f32],
-        alpha: &'a [f32],
-    ) -> HeadIo<'a> {
+    fn head_io<'a>(&self, t: usize, h: usize, q: &'a [f32], k: &'a [f32], v: &'a [f32], beta: &'a [f32], alpha: &'a [f32]) -> HeadIo<'a> {
         let c = &self.cfg;
         let ratio = c.n_v_heads / c.n_k_heads;
-        HeadIo {
-            t,
-            dk: c.k_head_dim,
-            dv: c.v_head_dim,
-            q,
-            k,
-            v,
-            nk: c.n_k_heads,
-            nv: c.n_v_heads,
-            kh: h / ratio,
-            h,
-            beta,
-            alpha,
-        }
+        HeadIo { t, dk: c.k_head_dim, dv: c.v_head_dim, q, k, v, nk: c.n_k_heads, nv: c.n_v_heads, kh: h / ratio, h, beta, alpha }
     }
 
     pub fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, DeltaCache) {
@@ -231,7 +206,7 @@ impl DeltaNet {
                 let mut s = vec![0.0; dv * dk];
                 let mut u = vec![0.0; dv];
                 let mut o = vec![0.0; t * dv];
-                let mut ck = Vec::with_capacity(((t + chunk - 1) / chunk) * dv * dk);
+                let mut ck = Vec::with_capacity(t.div_ceil(chunk) * dv * dk);
                 for p in 0..t {
                     if p % chunk == 0 {
                         ck.extend_from_slice(&s);
@@ -254,26 +229,8 @@ impl DeltaNet {
         let (normed, o_inv) = rmsnorm(&o, &self.norm_w, dv, self.eps, 0.0);
         let gated: Vec<f32> = normed.iter().zip(&z).map(|(n, zz)| n * silu(*zz)).collect();
         let y = self.out_proj.forward(&gated, t);
-        let cache = DeltaCache {
-            x: x.to_vec(),
-            conv,
-            q_hat,
-            k_hat,
-            q_n,
-            k_n,
-            q,
-            k,
-            v,
-            z,
-            a_raw,
-            beta,
-            alpha,
-            o,
-            o_inv,
-            normed,
-            gated,
-            ckpt,
-        };
+        let cache =
+            DeltaCache { x: x.to_vec(), conv, q_hat, k_hat, q_n, k_n, q, k, v, z, a_raw, beta, alpha, o, o_inv, normed, gated, ckpt };
         (y, cache)
     }
 
@@ -387,20 +344,15 @@ struct HeadGrads {
 fn head_backward(io: &HeadIo, ckpt: &[f32], d_o_all: &[f32], chunk: usize) -> HeadGrads {
     let (t, dk, dv) = (io.t, io.dk, io.dv);
     let sz = dv * dk;
-    let mut g = HeadGrads {
-        dq: vec![0.0; t * dk],
-        dk: vec![0.0; t * dk],
-        dv: vec![0.0; t * dv],
-        dbeta: vec![0.0; t],
-        dalpha: vec![0.0; t],
-    };
+    let mut g =
+        HeadGrads { dq: vec![0.0; t * dk], dk: vec![0.0; t * dk], dv: vec![0.0; t * dv], dbeta: vec![0.0; t], dalpha: vec![0.0; t] };
     let mut ds = vec![0.0f32; sz]; // dL/dS_t carried backwards
     let mut states = vec![0.0f32; chunk * sz]; // S_{t-1} for each step in the chunk
     let mut s = vec![0.0f32; sz];
     let mut sp = vec![0.0f32; sz]; // S'
     let mut u = vec![0.0f32; dv];
     let mut w = vec![0.0f32; dv];
-    let n_chunks = (t + chunk - 1) / chunk;
+    let n_chunks = t.div_ceil(chunk);
 
     for ci in (0..n_chunks).rev() {
         let start = ci * chunk;

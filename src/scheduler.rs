@@ -16,7 +16,7 @@ use crate::eval::{gate, measure, EvalReport, GateConfig};
 use crate::model::Model;
 use crate::registry::{now_unix, Registry};
 use crate::tokenizer::Example;
-use crate::train::{Control, StopReason, TrainConfig, TrainData, Trainer, PrefPair};
+use crate::train::{Control, PrefPair, StopReason, TrainConfig, TrainData, Trainer};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -148,11 +148,23 @@ pub struct JobConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Outcome {
-    Accepted { id: String, report: EvalReport },
-    Rejected { id: String, report: EvalReport },
+    Accepted {
+        id: String,
+        report: EvalReport,
+    },
+    Rejected {
+        id: String,
+        report: EvalReport,
+    },
     /// Conditions never allowed finishing before the deadline; the checkpoint is kept.
-    Deferred { reason: String, step: u64, total_steps: u64 },
-    Skipped { reason: String },
+    Deferred {
+        reason: String,
+        step: u64,
+        total_steps: u64,
+    },
+    Skipped {
+        reason: String,
+    },
 }
 
 /// Status file for `agentd` / the UI: `adapters/work/status.json`.
@@ -167,10 +179,7 @@ struct Status<'a> {
 
 fn write_status(dir: &Path, phase: &str, step: u64, total: u64, detail: Option<String>) {
     let _ = std::fs::create_dir_all(dir);
-    let _ = crate::adapter::write_json(
-        dir.join("status.json"),
-        &Status { ts: now_unix(), phase, step, total_steps: total, detail },
-    );
+    let _ = crate::adapter::write_json(dir.join("status.json"), &Status { ts: now_unix(), phase, step, total_steps: total, detail });
 }
 
 pub struct Heldout<'a> {
@@ -223,11 +232,7 @@ pub fn run_overnight(
         false
     };
     if resumed {
-        registry.ledger(
-            "resumed",
-            None,
-            serde_json::json!({"step": trainer.state.step, "total": trainer.state.total_steps}),
-        )?;
+        registry.ledger("resumed", None, serde_json::json!({"step": trainer.state.step, "total": trainer.state.total_steps}))?;
     } else {
         registry.ledger(
             "started",

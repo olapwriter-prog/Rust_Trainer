@@ -87,12 +87,7 @@ impl SafeTensors {
                 continue;
             }
             let dtype = val["dtype"].as_str().ok_or_else(|| bad("dtype"))?.to_string();
-            let shape = val["shape"]
-                .as_array()
-                .ok_or_else(|| bad("shape"))?
-                .iter()
-                .map(|x| x.as_u64().unwrap_or(0) as usize)
-                .collect();
+            let shape = val["shape"].as_array().ok_or_else(|| bad("shape"))?.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect();
             let off = val["data_offsets"].as_array().ok_or_else(|| bad("data_offsets"))?;
             let start = off[0].as_u64().ok_or_else(|| bad("offset"))?;
             let end = off[1].as_u64().ok_or_else(|| bad("offset"))?;
@@ -128,11 +123,7 @@ impl SafeTensors {
 
 /// Write f32 tensors (sorted by name) plus string metadata. Written to a temp
 /// file and renamed, so a crash never leaves a torn file behind.
-pub fn write_f32(
-    path: impl AsRef<Path>,
-    tensors: &[(String, Vec<usize>, &[f32])],
-    metadata: &BTreeMap<String, String>,
-) -> io::Result<()> {
+pub fn write_f32(path: impl AsRef<Path>, tensors: &[(String, Vec<usize>, &[f32])], metadata: &BTreeMap<String, String>) -> io::Result<()> {
     let path = path.as_ref();
     let mut hdr = Map::new();
     if !metadata.is_empty() {
@@ -145,10 +136,7 @@ pub fn write_f32(
     for (name, shape, data) in &sorted {
         assert_eq!(shape.iter().product::<usize>(), data.len(), "{name}: shape mismatch");
         let n = data.len() as u64 * 4;
-        hdr.insert(
-            name.clone(),
-            serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [off, off + n]}),
-        );
+        hdr.insert(name.clone(), serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [off, off + n]}));
         off += n;
     }
     let mut h = serde_json::to_vec(&Value::Object(hdr))?;

@@ -2,170 +2,153 @@
 
 The Phase 3 trainer for agentOS. It retrains the local model overnight on what you have **approved and corrected**, and swaps the result in only if it measurably does better.
 
-It trains a **LoRA adapter**: the base weights stay frozen and compressed, and small extra matrices learn the change. Backpropagation is written by hand through our own Qwen forward pass, including Qwen3.5's Gated DeltaNet layers. llama.cpp's trainer crashes on Qwen, and `candle` has no DeltaNet.
+It trains a **LoRA adapter**: the base weights stay frozen and compressed, and small extra matrices learn the change. Backpropagation is written by hand through the same forward pass the phone runs. For GGUF models that forward pass *is* the [Rust Inference Engine](https://github.com/olapwriter-prog/Rust_Interference_engine) (`rie-core`): its file loader, quant formats and SIMD kernels, and it is **bit-exact** with the engine's own `CpuBackend`. llama.cpp's trainer crashes on Qwen, and `candle` has no DeltaNet.
 
 ```
-agentd ctl learn ──► confirmed.jsonl ──► rust_trainer run ──► adapters/<id>/ ──► agentos-llm
-   (export)          (confirmed only)    (Deep + charging,      (PEFT format)     W·x + (α/r)·B·A·x
-                                          battery, heat;
-                                          pause/resume;
-                                          eval gate; ledger)
+agentd ctl learn ──► confirmed.jsonl ──► rust_trainer run ──────────────► model.adapters/<id>/adapter.gguf ──► rie engine
+   (export)          (confirmed only)    Deep + charging + battery + heat;  (llama.cpp LoRA GGUF)              y += (α/r)·B·A·x
+                                         pause/resume from checkpoints;
+                                         eval gate vs current model; ledger
 ```
 
 ## Status
 
 | Part | State |
 |---|---|
-| Backward through Qwen2.5 (dense): RMSNorm, GQA attention + RoPE + q/k/v bias, SwiGLU, frozen matmuls (input gradient only), LoRA | ✅ gradient-checked |
-| Backward through Qwen3.5: zero-centred RMSNorm, QK-norm, partial RoPE, gated attention output, **Gated DeltaNet with BPTT** (conv1d, L2-norm, β/α gates, delta-rule recurrence, gated norm) | ✅ gradient-checked |
-| Frozen weights as Q8_0 (or any engine format via the `FrozenMatmul` trait) | ✅ |
-| Training loop: AdamW, warm-up + cosine LR, gradient clipping, loss on answer tokens only, activation recomputation per block, chunked BPTT state checkpoints | ✅ |
-| DPO on corrections ("this, not that") against the frozen base | ✅ |
-| Confirmed-only data loading from `agentd ctl learn` JSONL | ✅ |
-| Adapter format (PEFT-compatible safetensors, so it also converts for llama.cpp) and reference `apply`/`merge` for the engine | ✅ |
-| Resumable checkpoints (exact: an interrupted run gives bit-identical weights) | ✅ |
-| Eval gate, swap, keep-N rollback, ledger | ✅ |
-| Power/heat policy (Deep + charging + battery + temperature, with hysteresis) and overnight orchestration | ✅ |
-| Loader for HF Qwen2.5 / Qwen3 / Qwen3.5 / Qwen3-Next safetensors | ✅ written; parity harness vs `transformers`+`peft` (`tools/parity.py`) included but **not yet run**: PyTorch could not be installed in the build sandbox |
-| Hook into `agentos-llm` and `agentd` | ⏳ both repositories were empty when this was written; the integration points are listed below |
-| Measured improvement on real held-out corrections (plan step 3) | ⏳ needs real weights and real data |
+| **GGUF models through `rie-core`**: llama / mistral / qwen2 (Qwen2.5) / qwen3; weights stay mmapped in their ggml format (F32, F16, BF16, Q4_0…Q8_0, Q2_K…Q6_K) | ✅ |
+| **Forward bit-exact with the engine**: 3 architectures × F32/F16/Q8_0/Q4_0/Q4_K/Q6_K × tied/untied on x86 (AVX2 and scalar) and AArch64 i8mm / dotprod / Cortex-A53 (QEMU) | ✅ tested |
+| Prompts tokenised exactly like `Engine::chat` (engine chat template + GGUF tokenizer) | ✅ tested |
+| Engine-loadable adapter: llama.cpp LoRA GGUF (`adapter.gguf`), plus PEFT safetensors | ✅ written; engine side specified in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md) |
+| Backward through Qwen2.5/Qwen3/Llama: RMSNorm, GQA attention, RoPE (NEOX and normal, rope_freqs), q/k/v bias, QK-norm, SwiGLU, frozen matmuls (input gradient only), LoRA | ✅ gradient-checked, also through the engine-backed model |
+| Backward through Qwen3.5: zero-centred RMSNorm, partial RoPE, gated attention, **Gated DeltaNet with BPTT** | ✅ gradient-checked (HF safetensors path; the engine has no Qwen3.5 yet) |
+| Training loop: AdamW, warm-up + cosine LR, clipping, answer-token loss, activation recomputation, chunked BPTT state checkpoints; DPO on corrections | ✅ |
+| Confirmed-only data, exact pause/resume, eval gate, swap, keep-5 rollback, ledger, Deep/charging/battery/heat policy with hysteresis | ✅ tested; end-to-end CLI run in CI |
+| `agentd` side (status file, launch, reload) | ⏳ `agenticOS` is still empty; contract in [`docs/AGENTD.md`](docs/AGENTD.md) |
+| Engine side (load and apply `adapter.gguf`) | ⏳ in the engine's own session; spec and acceptance test in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md) |
+| Measured improvement on real held-out corrections (plan step 3) | ⏳ needs a real GGUF and real confirmed data (Hugging Face downloads are blocked in this sandbox) |
+| Parity of the HF/Qwen3.5 path with `transformers` + `peft` | ⏳ harness in `tools/parity.py`, not yet run (no PyTorch here) |
+
+## Build
+
+Same toolchain settings as the engine: Rust ≥ 1.82, edition 2021, `rustfmt` at width 140, `clippy -D warnings`, fat LTO, `panic = "abort"`, and the same `.cargo/config.toml` for Android/iOS/AArch64. `rie-core` comes from the engine's repository, pinned in `Cargo.lock`.
+
+```sh
+cargo build --release                          # with rie-core (default)
+cargo build --release --no-default-features    # HF safetensors only, no engine
+cargo build --release --features hf-tokenizers # raw-text data for HF directories
+cargo check --target aarch64-linux-android     # phone build check (also aarch64-apple-ios)
+cargo test                                     # 28 tests: engine parity, gradient checks, training, scheduler
+```
 
 ## Commands
 
 ```sh
-cargo build --release                                # add --features hf-tokenizers to train on raw text
-
-rust_trainer toy                                     # self-contained demo on a random-weight Qwen3.5-shaped model
-rust_trainer info   --model ~/models/qwen3.5-4b      # parameter counts, adapter memory, FLOP/token
-rust_trainer train  --model DIR --data confirmed.jsonl --out DIR/adapters/manual   # one-shot train + eval
-rust_trainer eval   --model DIR --adapter DIR/adapters/<id> --data confirmed.jsonl
-rust_trainer run    --model DIR --data confirmed.jsonl --status /run/agentd/device.json --hours 8
-rust_trainer status --model DIR
-rust_trainer rollback --model DIR --reason "user asked"
+rust_trainer info     --model qwen3-4b-q4_0.gguf                  # sizes, adapter memory, FLOP/token
+rust_trainer train    --model M.gguf --data confirmed.jsonl --out M.adapters/manual
+rust_trainer eval     --model M.gguf --adapter DIR --data confirmed.jsonl      # DIR may hold only adapter.gguf
+rust_trainer run      --model M.gguf --data confirmed.jsonl --status /run/agentd/device.json --hours 7
+rust_trainer status   --model M.gguf
+rust_trainer rollback --model M.gguf --reason "user asked"
+rust_trainer synth    --out m.gguf --arch qwen3 --wtype Q4_0       # random-weight GGUF (or --preset qwen3-0.6b)
+rust_trainer toy                                                   # Qwen3.5-shaped demo, no files needed
 ```
 
-Common options are `--rank 8 --alpha 16 --lr 2e-4 --epochs 2 --batch 4 --max-len 512 --heldout 0.1 --q8 --dpo 0.1 --min-improvement 0.02 --min-examples 8 --min-train 50 --min-battery 50 --max-temp 40 --bptt-chunk 16`.
+`--model` takes a `.gguf` file (engine path) or a Hugging Face directory. The options are:
 
-`toy` output on this machine (4 vCPU): loss falls from 6.37 to 0.53 in 60 steps (6 s). On held-out commands with **unseen** device/room combinations, answer-token accuracy goes from 0% to 94.5% and NLL drops 92%, so the gate accepts.
+* **Training:** `--rank 8 --alpha 16 --lr 2e-4 --epochs 2 --batch 4 --max-len 512 --heldout 0.1 --dpo BETA`
+* **Gate:** `--min-improvement 0.02 --min-examples 8`
+* **Scheduling:** `--min-train 50 --min-battery 50 --max-temp 40`
+* **Engine:** `--threads N --no-pin --template chatml`
+
+An end-to-end run on a synthetic Q4_0 Qwen3 GGUF (it is also in CI) went like this:
+
+* 2 unconfirmed records were dropped.
+* Training took 3 s, held-out NLL fell 81%, and the gate accepted.
+* The next "night" was deferred at 43 °C, then resumed from the checkpoint once the phone cooled. Its candidate was measured against the *current* adapter (not the base), beat it by 19%, and was promoted.
+* `eval` from `adapter.gguf` alone reproduced the result, and `rollback` restored the previous adapter.
+
+## How it matches the engine
+
+| Engine behaviour | Trainer |
+|---|---|
+| Weights are `rie_core::tensor::Weight` views of the GGUF mmap | the same views (`rie::RieFrozen`), no copies |
+| `matmul` quantises activations to int8 / Q8_K and runs SDOT/SMMLA/AVX2 kernels | calls that same `matmul`. The backward pass `dx = dy·W` dequantises rows (straight-through for the int8 rounding, as in QLoRA) |
+| f16 KV cache read with `dot_f16_f32` / `axpy_f16` | K/V rounded to f16 and read with the same functions (identity in the backward pass) |
+| `dot_f32`, `x·s·w` RMSNorm, in-place `x·(s·w)` QK-norm, `x/(1+e^{-x})` SiLU, scaled-q attention, RoPE tables | the same functions and operation order |
+| `ChatTemplate::render` + `encode(…, add_bos, parse_special)` | identical prompt tokens, and the answer ends with the template's end-of-turn token |
+
+Because int8 rounding of activations amplifies any sub-ulp difference, the test requires exact equality (`tests/engine.rs::logits_match_engine`).
 
 ## 1. Learn from your data, confirmed only
 
-The input is JSON Lines from `agentd ctl learn`:
-
-```jsonl
-{"id":"r17","prompt":"dim the hall lamp","response":"{\"act\":\"dim\",\"dev\":\"lamp\",\"room\":\"hall\"}","confirmed":true}
-{"id":"c03","prompt":"clean up downloads","chosen":"fs.trash(~/Downloads/*.tmp)","rejected":"rm -rf ~/Downloads","status":"corrected"}
-{"id":"m09","confirmed":true,"messages":[{"role":"system","content":"…"},{"role":"user","content":"…"},{"role":"assistant","content":"…"}]}
-```
-
-* A record is used **only** if it says `"confirmed": true` or has a `status` of `confirmed`/`approved`/`corrected`. Everything else is dropped and counted, including the model's own unconfirmed output (`data.rs`, tested in `only_confirmed_records_are_kept`).
-* Supervised records (`prompt`/`messages` + `response`) train with cross-entropy on the answer tokens only. Preference records (`chosen`/`rejected`) train with DPO (`--dpo β`).
-* Field aliases are accepted (`answer`, `completion`, `corrected`, `original`, `model_output`, …). Any text field may instead come pre-tokenised as `<field>_ids`, so `agentd` can use the engine's tokenizer and the trainer needs none.
-* The train/held-out split is deterministic by id hash, or explicit via `"split":"heldout"`. An example never moves sides between nights.
-* Formatting is Qwen ChatML. For Qwen3.5 the assistant turn is prefixed with the empty think block (`<think>\n\n</think>\n\n`), matching non-thinking inference. That prefix belongs to the prompt and is not trained.
+A record is used only if it says `"confirmed": true` or has `status` `confirmed`/`approved`/`corrected`. Supervised records (`prompt`/`messages` + `response`) train with cross-entropy on the answer tokens only. Corrections (`chosen`/`rejected`) train with DPO (`--dpo β`). The split is deterministic by id. The full schema is in [`docs/AGENTD.md`](docs/AGENTD.md).
 
 ## 2. LoRA, not the whole model
 
-`Linear` = frozen `W` (+ bias) + optional adapter: `y = W·x + b + (α/r)·B·(A·x)`, with A initialised kaiming-uniform and B = 0, so a fresh adapter is an exact no-op. The default targets are every projection: `q,k,v,o` / `in_proj_qkv, in_proj_z, out_proj` / `gate, up, down`.
+`y = W·x + b + (α/r)·B·(A·x)` with B initialised to 0, so a fresh adapter is a no-op. The default targets are every projection (`attn_q/k/v/output`, `ffn_gate/up/down`, plus DeltaNet `in_proj_qkv/z`, `out_proj` for Qwen3.5).
 
-For a Qwen3.5-4B-shaped config (`rust_trainer info`):
-
-| rank | LoRA params | adapter + grads + AdamW (f32) |
+| Qwen3.5-4B-shaped, all projections | LoRA params | adapter + grads + AdamW |
 |---|---|---|
-| 8 | 15.2 M | 244 MB |
-| 16 | 30.5 M | 488 MB |
-
-Frozen weights only need `forward` (x·Wᵀ) and `backward_input` (dy·W). That is the whole `FrozenMatmul` trait, so the engine's compressed kernels plug in directly and no dequantised copy is made. The built-in types are f32 and Q8_0.
+| r = 8 | 15.2 M | 244 MB |
+| r = 16 | 30.5 M | 488 MB |
 
 ## 3. Run only when harmless
 
-`scheduler::PowerPolicy` allows training only in the **Deep** stage, **while charging**, with **battery ≥ min** and **temperature < limit**. A paused run restarts only 3 °C cooler and 5 % fuller than the pause limits (hysteresis). The device state is read before **every example**. When a condition fails, the partial step is discarded, a checkpoint of the last completed step is written, and the run waits. Plugging back in resumes from the checkpoint. The resumed run is bit-identical to an uninterrupted one (`pause_resume_is_exact`). A checkpoint whose data or config changed is refused, and the run restarts.
-
-`agentd` publishes the state as JSON, which the trainer reads with `--status`:
-
-```json
-{"stage":"deep","charging":true,"battery_pct":83,"temp_c":31.5}
-```
-
-An unreadable state counts as "not allowed". `agentd` launches `rust_trainer run` under its existing chip-priority Training mode. The trainer writes `adapters/work/status.json` (`waiting`/`training`/`evaluating`, with step counts) for the UI.
+Training runs only in the **Deep** stage, **charging**, with **battery ≥ min** and **temperature < limit**. The device state is re-read before every example. When a condition fails, the run pauses with a checkpoint and waits; restarting needs 3 °C cooler and 5 % more battery. Resuming is bit-identical to an uninterrupted run. A checkpoint whose data or config changed is discarded, and training restarts.
 
 ## 4. Eval gate, swap, rollback
 
-When training finishes, the candidate is measured on held-out confirmed examples against the **current** model: the base plus the active adapter, or the base alone if none is active. It is promoted only if:
+The candidate must beat the **current** model (base plus active adapter) on held-out confirmed examples:
 
-* there are at least `min_examples` held-out examples,
-* mean answer-token NLL falls by ≥ `min_rel_improvement` (default 2 %),
-* greedy answer accuracy does not fall, and
-* preference accuracy on held-out corrections does not fall.
+* NLL must fall by at least 2 %;
+* greedy accuracy and preference accuracy must not fall;
+* there must be at least 8 examples.
 
-Otherwise the candidate is deleted. The registry keeps the last 5 accepted adapters. `rollback` steps back through them to the base model.
-
-```
-<model_dir>/adapters/
-  ACTIVE  history.json  ledger.jsonl  <id>/  work/
-```
-
-`ledger.jsonl` gets one line per event: `started`, `resumed`, `paused` (with reason), `deferred`, `restarted`, `skipped`, `accepted`, `rejected` (with the full eval report), and `rollback`.
+Otherwise the candidate is deleted. The last 5 accepted adapters are kept, and `rollback` walks back to the base model. Every transition is a ledger line. The registry lives next to the model: `model.adapters/` beside `model.gguf`, or `<dir>/adapters/` for an HF directory.
 
 ## 5. Never touches the approval rules
 
-The trainer reads only the training set and the model, and writes only `<model_dir>/adapters/`. It has no access to the executor's tiers or approval key, and nothing it produces is more than additive weight deltas. Whatever the model learns, approval stays with the executor.
+The trainer reads the model and the export and writes only the adapter registry. Tiers and the approval key stay with the executor.
 
-## Adapter format
+## Measured speed
 
-```
-adapters/<id>/adapter_model.safetensors   base_model.model.<module>.lora_A.weight [r×in], lora_B.weight [out×r]  (F32)
-adapters/<id>/adapter_config.json         PEFT LoRA config
-adapters/<id>/trainer_meta.json           base fingerprint, data size, steps, loss, eval report
-```
+These were measured in this build sandbox: 4 x86 vCPUs, AVX2, engine threads = 4. Weights are random, but the shapes are real (`rie synth` presets). Sequence length 128, loss on 64 answer tokens, r = 8.
 
-This is exactly the layout Hugging Face PEFT writes. llama.cpp's `convert_lora_to_gguf.py` reads it, which covers the optional llama.cpp compatibility. In `agentos-llm`, apply it per projection as `y += (α/r)·B·(A·x)` (`adapter::LoraAdapter::apply`), or merge it once into dense weights (`merge_into`). The base fingerprint (config + module shapes) is checked on load, so an adapter is never applied to a different model.
+| model (Q4_0) | forward | training step (forward + recompute + backward) |
+|---|---|---|
+| Qwen2.5-0.5B | 93 tok/s | 21 tok/s |
+| Qwen3-0.6B | 70 tok/s | 17 tok/s |
 
-## How the backward pass is built
+A training step costs about 4.4× a forward pass. Most of the backward time is `dx = dy·W` from dequantised rows. The engine has no transposed int8 kernel, and keeping transposed copies would double weight memory on the phone.
 
-* **Frozen matmuls:** gradient to the input only, `dx = dy·W`, computed straight from the compressed weights.
-* **LoRA:** `dA = s·(dy·B)ᵀ·x`, `dB = s·dyᵀ·(A·x)`, `dx += s·(dy·B)·A`.
-* **RMSNorm, L2-norm, SwiGLU, sigmoid gates, softplus:** closed-form input gradients. The norm weights are frozen.
-* **Attention:** softmax backward per head (parallel), GQA reduction into the shared KV heads, and RoPE backward as the inverse rotation.
-* **Gated DeltaNet:** state `S∈R^{dv×dk}` per value head. Forward: `S'=αS`, `u=v−S'k`, `S=S'+βukᵀ`, `o=Sq`. Backward, through time:
-  `dS += do·qᵀ`, `dq = Sᵀdo`, `w = dS·k`, `dv = βw`, `dβ = u·w`, `dk = β(dSᵀu − S'ᵀw)`, `dS' = dS − βwkᵀ`, `dα = ⟨dS', S_{t−1}⟩`, `dS_{t−1} = α·dS'`.
-  Only every `bptt_chunk`-th state is stored. The states inside a chunk are recomputed during the backward pass, so memory is `O((T/c + c)·dv·dk)` per head, not `O(T·dv·dk)`.
-* **Gradient checkpointing:** only each block's input is kept from the forward pass. Each block is recomputed just before its backward.
-* **Head:** logits are computed only at answer positions, in chunks, so no `[T × vocab]` matrix is ever built.
+At these rates, 200 examples × 100 tokens × 2 epochs (40 k trained tokens) take about 30 min for 0.5B. Scaled by size, 4B would take about 4 h on this sandbox. Phone performance cores with dotprod/i8mm run the int8 forward faster than these vCPUs, but the f32 backward has not been measured on a device. Reproduce with `cargo run --release --example bench_train -- qwen3-4b Q4_0 128 3`.
 
-### Tests
+## Backward pass, briefly
 
-`cargo test` runs these:
+* **Frozen matmuls:** `dx = dy·W` only.
+* **LoRA:** `dA = s·(dy·B)ᵀ·x`, `dB = s·dyᵀ·(A·x)`.
+* **Norms, SwiGLU, gates:** closed form.
+* **Attention:** softmax backward per head, with RoPE backward as the inverse rotation.
+* **Gated DeltaNet:** backpropagation through time over `S' = αS, u = v − S'k, S = S' + βukᵀ, o = Sq`. Only every `bptt_chunk`-th state is stored; the rest are recomputed.
+* **Memory:** each block is recomputed in the backward pass (activation checkpointing), and logits are computed only at answer positions.
 
-* `tests/gradcheck.rs` checks every op and every mixer variant (dense attention with bias; gated, QK-normed partial-RoPE attention; DeltaNet with BPTT chunk sizes 1, 3, 4, 7 and 20) against central finite differences. It also checks LoRA gradients end-to-end through dense and hybrid models in f32 and Q8_0, and confirms that activation recomputation gives the same gradients as storing activations.
-* `tests/training.rs` checks that loss falls and the gate accepts; that pause/resume is exact; that DPO moves preferences (pairwise accuracy → 100%); that the adapter round-trips and engine `apply`/`merge` agree with training; that the overnight flow works (wait → train → heat pause → resume → accept; a second night rejected against the current adapter; skip; defer; rollback; exact ledger sequence); and the power-policy hysteresis.
-* `tools/parity.py` + `examples/parity.rs` (run manually, needs `torch transformers peft`) build random-weight Qwen2 / Qwen3.5 / Qwen3-Next models in `transformers`, attach a random PEFT LoRA, and compare base and adapted log-probs, the loss, and every LoRA gradient (autograd vs our backward). It also exercises the HF loader and PEFT adapter loading:
-  `cargo build --release --example parity && python tools/parity.py`
-* Unit tests cover the data filter, chat formatting and masking, the safetensors round-trip, the registry, the LR schedule and Q8_0.
+## Tests
 
-## Feasibility on a phone (estimates, not measured on device)
+* **`tests/engine.rs`:**
+  * bit-exact logits against `CpuBackend` (36 configurations; also run on the three AArch64 tiers and with the scalar kernels);
+  * dequantised input gradient against a dense reference for 8 quant formats;
+  * numerical LoRA gradients through engine-backed Llama/Qwen2/Qwen3;
+  * f16 rounding identical to the engine's KV conversion;
+  * prompt tokens identical to `Engine::chat`;
+  * training a Q4_0 model plus the `adapter.gguf` round-trip;
+  * refusal of unsupported architectures.
+* **`tests/gradcheck.rs`:** every op and mixer (including DeltaNet with BPTT chunk sizes 1, 3, 4, 7 and 20) against finite differences, and end-to-end LoRA gradients in f32 and Q8_0.
+* **`tests/training.rs`:** loss falls and the gate accepts; pause/resume is exact; DPO; PEFT adapter round-trip with apply/merge; the overnight flow with exact ledger sequence; power hysteresis.
+* **Unit tests:** data filter, chat formatting, safetensors, registry, LR schedule, Q8_0.
 
-| | Qwen3.5-4B (r=8) |
-|---|---|
-| Frozen weights | ≈ 2.7 GB in the engine's compressed format (memory-mapped) |
-| Adapter + grads + AdamW | 244 MB |
-| Activations | ≈ 0.5–1 GB at T≈512 with per-block recomputation |
-| Compute | ≈ 34 GFLOP per trained token with recomputation (≈ 25 without) |
+## Integration still to do (other repositories)
 
-200 examples × 100 tokens × 2 epochs ≈ 1.3 PFLOP, so roughly 1–4 h on a phone CPU. Qwen3.5-2B/0.8B is 2–5× faster.
-
-## Integration points still to wire up
-
-`Rust_Interference_engine` and `agenticOS` were empty when this was written, so these are interfaces, not calls:
-
-1. **Engine weights.** Implement `frozen::FrozenMatmul` over the engine's compressed tensors (forward = its existing matmul; `backward_input` = the same kernel transposed) and build `Model` from them instead of `hf::load_model`.
-2. **Engine adapter.** At load time, read `adapters/ACTIVE` and apply `adapters/<id>` via `LoraAdapter::apply` (or merge).
-3. **Tokenizer.** Either `agentd` exports `*_ids` produced by the engine's tokenizer, or implement `tokenizer::Tokenizer` over it.
-4. **agentd.** Write the device-state JSON, start `rust_trainer run` in the charging Deep stage under the Training mode, and surface `status`/`ledger.jsonl`. `learn eval` can call `rust_trainer eval`.
-
-## Roadmap (from the plan)
-
-1. ✅ Prove backpropagation: gradient checks, then training loss falling on a toy set (dense and hybrid).
-2. ✅ DeltaNet backward pass for Qwen3.5.
-3. ⏳ Measured improvement on real held-out corrections on the Mac, through the eval gate.
-4. ⏳ Overnight scheduling, swap and rollback in `agentd`, then a run in the VM. The trainer side is done; the agentd side is pending.
+1. **Engine:** load `model.adapters/ACTIVE` → `<id>/adapter.gguf` and add `s·B·(A·x)` after each adapted matmul, as specified in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md) with an acceptance test that should be bit-exact.
+2. **Engine:** Qwen3.5 (Gated DeltaNet) support. The trainer's DeltaNet forward and backward are ready. Once the engine can read Qwen3.5 GGUFs, the same `RieFrozen` bridge applies.
+3. **agentd:** write the device-state file, launch `rust_trainer run` in the charging Deep stage under the Training mode, and reload the LLM after `accepted`, per [`docs/AGENTD.md`](docs/AGENTD.md).
+4. **Plan step 3:** run on a real GGUF (e.g. Qwen2.5-0.5B/Qwen3-0.6B Q4_0) with real confirmed corrections, on the Mac and then in the VM.

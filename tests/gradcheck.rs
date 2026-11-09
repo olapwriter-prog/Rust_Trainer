@@ -31,10 +31,7 @@ where
         let xp: Vec<f32> = x.iter().zip(&d).map(|(a, b)| a + eps * b).collect();
         let xm: Vec<f32> = x.iter().zip(&d).map(|(a, b)| a - eps * b).collect();
         let numeric = (dot64(&f(&xp), &r) - dot64(&f(&xm), &r)) / (2.0 * eps as f64);
-        assert!(
-            close(analytic, numeric, 2e-2, 2e-3),
-            "{name} trial {trial}: analytic {analytic} vs numeric {numeric}"
-        );
+        assert!(close(analytic, numeric, 2e-2, 2e-3), "{name} trial {trial}: analytic {analytic} vs numeric {numeric}");
     }
 }
 
@@ -63,10 +60,16 @@ fn l2norm_grad() {
     let mut rng = Rng::new(2);
     let d = 8;
     let x = rng.vec_normal(4 * d, 1.0);
-    check_input("l2norm", &x, x.len(), |x| l2norm(x, d, 1e-6).0, |x, dy| {
-        let (y, n) = l2norm(x, d, 1e-6);
-        l2norm_backward(&y, &n, dy, d)
-    });
+    check_input(
+        "l2norm",
+        &x,
+        x.len(),
+        |x| l2norm(x, d, 1e-6).0,
+        |x, dy| {
+            let (y, n) = l2norm(x, d, 1e-6);
+            l2norm_backward(&y, &n, dy, d)
+        },
+    );
 }
 
 #[test]
@@ -196,11 +199,8 @@ fn model_lora_grads() {
         model.checkpointing = true;
         model.zero_grad();
         model.forward_backward(&tokens, &targets, &w);
-        let grads_ckpt: Vec<(Vec<f32>, Vec<f32>)> = model
-            .lora_linears()
-            .iter()
-            .map(|l| (l.lora.as_ref().unwrap().ga.clone(), l.lora.as_ref().unwrap().gb.clone()))
-            .collect();
+        let grads_ckpt: Vec<(Vec<f32>, Vec<f32>)> =
+            model.lora_linears().iter().map(|l| (l.lora.as_ref().unwrap().ga.clone(), l.lora.as_ref().unwrap().gb.clone())).collect();
         model.checkpointing = false;
         model.zero_grad();
         model.forward_backward(&tokens, &targets, &w);

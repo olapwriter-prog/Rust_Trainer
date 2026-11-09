@@ -134,7 +134,7 @@ pub struct AttnCache {
     q: Vec<f32>, // after norm + rope  [t × nh × hd]
     k: Vec<f32>, // [t × nkv × hd]
     v: Vec<f32>,
-    gate: Vec<f32>, // pre-sigmoid gate [t × nh × hd] (empty if no gate)
+    gate: Vec<f32>,  // pre-sigmoid gate [t × nh × hd] (empty if no gate)
     probs: Vec<f32>, // [nh × t × t]
     o: Vec<f32>,     // attention output before gate [t × nh × hd]
     og: Vec<f32>,    // o_proj input [t × nh × hd]
@@ -231,11 +231,7 @@ impl Attention {
                 o[(i * nh + h) * hd..(i * nh + h + 1) * hd].copy_from_slice(&out[i * hd..(i + 1) * hd]);
             }
         }
-        let og = if c.output_gate {
-            o.iter().zip(&gate).map(|(a, g)| a * sigmoid(*g)).collect()
-        } else {
-            o.clone()
-        };
+        let og = if c.output_gate { o.iter().zip(&gate).map(|(a, g)| a * sigmoid(*g)).collect() } else { o.clone() };
         let y = self.o_proj.forward(&og, t);
         let cache = AttnCache { x: x.to_vec(), q_raw, k_raw, q_inv, k_inv, q, k, v, gate, probs, o, og };
         (y, cache)

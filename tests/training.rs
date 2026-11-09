@@ -30,10 +30,7 @@ fn small_model(seed: u64, q8: bool) -> Model {
 fn examples(pairs: &[(&str, &str)]) -> Vec<Example> {
     let tok = ByteTokenizer;
     let f = ChatFormat::qwen(&tok, "", 96).unwrap();
-    pairs
-        .iter()
-        .map(|(p, r)| f.example(&tok, None, &Text::Str(p.to_string()), &Text::Str(r.to_string())).unwrap())
-        .collect()
+    pairs.iter().map(|(p, r)| f.example(&tok, None, &Text::Str(p.to_string()), &Text::Str(r.to_string())).unwrap()).collect()
 }
 
 fn toy_sets() -> (Vec<Example>, Vec<Example>) {
@@ -45,7 +42,11 @@ fn toy_sets() -> (Vec<Example>, Vec<Example>) {
         for (j, r) in rooms.iter().enumerate() {
             let p = format!("on {d} {r}");
             let a = format!("act=on dev={d} room={r}");
-            if (i + j) % 4 == 0 { he.push((p, a)) } else { tr.push((p, a)) }
+            if (i + j) % 4 == 0 {
+                he.push((p, a))
+            } else {
+                tr.push((p, a))
+            }
         }
     }
     let conv = |v: Vec<(String, String)>| {
@@ -56,16 +57,7 @@ fn toy_sets() -> (Vec<Example>, Vec<Example>) {
 }
 
 fn cfg(epochs: usize) -> TrainConfig {
-    TrainConfig {
-        rank: 4,
-        alpha: 8.0,
-        lr: 5e-3,
-        epochs,
-        batch_size: 3,
-        warmup_steps: 2,
-        checkpoint_every: 2,
-        ..Default::default()
-    }
+    TrainConfig { rank: 4, alpha: 8.0, lr: 5e-3, epochs, batch_size: 3, warmup_steps: 2, checkpoint_every: 2, ..Default::default() }
 }
 
 #[test]
@@ -162,13 +154,7 @@ fn adapter_roundtrip_apply_and_merge() {
     let mut model = small_model(4, false);
     let mut t = Trainer::new(&mut model, cfg(1), TrainData::Sft(tr));
     t.run(&mut RunToEnd, None, |_| {}).unwrap();
-    let meta = AdapterMeta {
-        id: "x".into(),
-        base_fingerprint: base_fingerprint(t.model),
-        rank: 4,
-        alpha: 8.0,
-        ..Default::default()
-    };
+    let meta = AdapterMeta { id: "x".into(), base_fingerprint: base_fingerprint(t.model), rank: 4, alpha: 8.0, ..Default::default() };
     save_adapter(t.model, &dir, &meta).unwrap();
     let ex = &he[0];
     let targets = answer_targets(&ex.tokens, ex.answer_start);
@@ -203,8 +189,7 @@ fn adapter_roundtrip_apply_and_merge() {
     let st = rust_trainer::safetensors::SafeTensors::open(dir.join("adapter_model.safetensors")).unwrap();
     assert!(st.contains("base_model.model.model.layers.0.linear_attn.in_proj_qkv.lora_A.weight"));
     assert!(st.contains("base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight"));
-    let cfgj: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("adapter_config.json")).unwrap()).unwrap();
+    let cfgj: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("adapter_config.json")).unwrap()).unwrap();
     assert_eq!(cfgj["peft_type"], "LORA");
 
     // A different architecture refuses the adapter.
@@ -332,10 +317,7 @@ fn overnight_gate_swap_rollback_and_ledger() {
     // Rollback returns to the base model.
     assert_eq!(registry.rollback("test").unwrap(), None);
     let events: Vec<String> = registry.read_ledger().into_iter().map(|e| e.event).collect();
-    assert_eq!(
-        events,
-        vec!["started", "paused", "accepted", "started", "rejected", "skipped", "started", "deferred", "rollback"]
-    );
+    assert_eq!(events, vec!["started", "paused", "accepted", "started", "rejected", "skipped", "started", "deferred", "rollback"]);
     std::fs::remove_dir_all(dir).ok();
 }
 

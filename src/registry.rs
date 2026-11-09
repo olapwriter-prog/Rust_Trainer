@@ -43,8 +43,11 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn open(model_dir: impl AsRef<Path>) -> io::Result<Self> {
-        let root = model_dir.as_ref().join("adapters");
+    /// Registry next to the model: `<dir>/adapters/` for a model directory,
+    /// `<name>.adapters/` beside a model file such as `qwen3-4b-q4_0.gguf`.
+    pub fn open(model: impl AsRef<Path>) -> io::Result<Self> {
+        let p = model.as_ref();
+        let root = if p.is_file() { p.with_extension("adapters") } else { p.join("adapters") };
         fs::create_dir_all(&root)?;
         Ok(Registry { root, keep: 5 })
     }
@@ -74,10 +77,7 @@ impl Registry {
     }
 
     fn history(&self) -> History {
-        fs::read(self.root.join("history.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        fs::read(self.root.join("history.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
     fn save_history(&self, h: &History) -> io::Result<()> {
@@ -151,11 +151,7 @@ impl Registry {
         let target = h.accepted.last().cloned();
         self.save_history(&h)?;
         self.set_active(target.as_deref())?;
-        self.ledger(
-            "rollback",
-            target.as_deref(),
-            serde_json::json!({"from": current, "to": target, "reason": reason}),
-        )?;
+        self.ledger("rollback", target.as_deref(), serde_json::json!({"from": current, "to": target, "reason": reason}))?;
         Ok(target)
     }
 }

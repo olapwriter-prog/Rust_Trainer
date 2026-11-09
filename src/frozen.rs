@@ -31,9 +31,18 @@ pub const QK8_0: usize = 32;
 
 /// Built-in frozen weight storage.
 pub enum FrozenWeight {
-    F32 { w: Vec<f32>, out: usize, inp: usize },
+    F32 {
+        w: Vec<f32>,
+        out: usize,
+        inp: usize,
+    },
     /// Q8_0: per-32-element block an f32 scale and 32 signed bytes.
-    Q8_0 { scales: Vec<f32>, qs: Vec<i8>, out: usize, inp: usize },
+    Q8_0 {
+        scales: Vec<f32>,
+        qs: Vec<i8>,
+        out: usize,
+        inp: usize,
+    },
 }
 
 impl FrozenWeight {
@@ -121,11 +130,7 @@ impl FrozenMatmul for FrozenWeight {
                 y.par_chunks_mut(out).enumerate().for_each(|(ti, yr)| {
                     let xr = &x[ti * inp..(ti + 1) * inp];
                     for (o, yv) in yr.iter_mut().enumerate() {
-                        *yv = q8_dot(
-                            &scales[o * bpr..(o + 1) * bpr],
-                            &qs[o * inp..(o + 1) * inp],
-                            xr,
-                        );
+                        *yv = q8_dot(&scales[o * bpr..(o + 1) * bpr], &qs[o * inp..(o + 1) * inp], xr);
                     }
                 });
                 y
@@ -154,12 +159,7 @@ impl FrozenMatmul for FrozenWeight {
                     let dyr = &dy[ti * out..(ti + 1) * out];
                     for (o, g) in dyr.iter().enumerate() {
                         if *g != 0.0 {
-                            q8_axpy(
-                                *g,
-                                &scales[o * bpr..(o + 1) * bpr],
-                                &qs[o * inp..(o + 1) * inp],
-                                dxr,
-                            );
+                            q8_axpy(*g, &scales[o * bpr..(o + 1) * bpr], &qs[o * inp..(o + 1) * inp], dxr);
                         }
                     }
                 });

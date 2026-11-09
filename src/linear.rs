@@ -21,14 +21,7 @@ impl Lora {
     pub fn new(rank: usize, alpha: f32, inp: usize, out: usize, rng: &mut Rng) -> Self {
         let bound = 1.0 / (inp as f32).sqrt();
         let a = (0..rank * inp).map(|_| rng.uniform_sym(bound)).collect();
-        Lora {
-            rank,
-            alpha,
-            a,
-            b: vec![0.0; out * rank],
-            ga: vec![0.0; rank * inp],
-            gb: vec![0.0; out * rank],
-        }
+        Lora { rank, alpha, a, b: vec![0.0; out * rank], ga: vec![0.0; rank * inp], gb: vec![0.0; out * rank] }
     }
     pub fn scale(&self) -> f32 {
         self.alpha / self.rank as f32
@@ -111,7 +104,7 @@ impl Linear {
             let r = l.rank;
             let s = l.scale();
             let h = matmul_nt(x, &l.a, t, inp, r); // [t × r]
-            // dB[out×r] += s · dyᵀ·h
+                                                   // dB[out×r] += s · dyᵀ·h
             let sdy: Vec<f32> = dy.iter().map(|v| v * s).collect();
             matmul_tn_acc(&mut l.gb, &sdy, &h, t, out, r);
             // g = s · dy·B   [t × r]

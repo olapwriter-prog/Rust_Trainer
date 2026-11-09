@@ -2,7 +2,7 @@
 //! full backward pass with per-block activation recomputation (gradient
 //! checkpointing).
 
-use crate::attention::{AttnCache, AttnConfig, Attention};
+use crate::attention::{Attention, AttnCache, AttnConfig};
 use crate::deltanet::{DeltaCache, DeltaNet, DeltaNetConfig};
 use crate::frozen::{Frozen, FrozenWeight};
 use crate::linear::Linear;
@@ -74,12 +74,7 @@ impl ModelConfig {
             vocab_size: vocab,
             hidden_size: 32,
             intermediate_size: 48,
-            layer_kinds: vec![
-                LayerKind::LinearAttention,
-                LayerKind::LinearAttention,
-                LayerKind::LinearAttention,
-                LayerKind::FullAttention,
-            ],
+            layer_kinds: vec![LayerKind::LinearAttention, LayerKind::LinearAttention, LayerKind::LinearAttention, LayerKind::FullAttention],
             attn: AttnConfig {
                 n_heads: 4,
                 n_kv_heads: 2,
@@ -92,14 +87,7 @@ impl ModelConfig {
                 rope_freq_scale: 1.0,
                 kv_f16: false,
             },
-            delta: Some(DeltaNetConfig {
-                n_k_heads: 2,
-                n_v_heads: 4,
-                k_head_dim: 8,
-                v_head_dim: 8,
-                conv_kernel: 4,
-                bptt_chunk: 3,
-            }),
+            delta: Some(DeltaNetConfig { n_k_heads: 2, n_v_heads: 4, k_head_dim: 8, v_head_dim: 8, conv_kernel: 4, bptt_chunk: 3 }),
             rms_eps: 1e-6,
             norm_offset: 1.0,
             tie_embeddings: true,
@@ -146,6 +134,7 @@ impl Mlp {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // one per layer; boxing would only add indirection
 pub enum Mixer {
     Attn(Attention),
     Delta(DeltaNet),
@@ -271,18 +260,8 @@ pub fn canonical_module(name: &str) -> &str {
 }
 
 /// Which projections receive LoRA adapters (matched against the last path component).
-pub const DEFAULT_TARGETS: &[&str] = &[
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-    "in_proj_qkv",
-    "in_proj_z",
-    "out_proj",
-];
+pub const DEFAULT_TARGETS: &[&str] =
+    &["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "in_proj_qkv", "in_proj_z", "out_proj"];
 
 impl Model {
     pub fn hidden(&self) -> usize {
@@ -303,9 +282,7 @@ impl Model {
                 FrozenWeight::f32(w, out, inp).into_arc()
             }
         };
-        let norm = |rng: &mut Rng, n: usize, off: f32| -> Vec<f32> {
-            (0..n).map(|_| 1.0 - off + rng.uniform_sym(0.2)).collect()
-        };
+        let norm = |rng: &mut Rng, n: usize, off: f32| -> Vec<f32> { (0..n).map(|_| 1.0 - off + rng.uniform_sym(0.2)).collect() };
         let off = cfg.norm_offset;
         let embed = mk(&mut rng, cfg.vocab_size, d);
         let a = cfg.attn.clone();
@@ -322,11 +299,7 @@ impl Model {
                         q_proj: Linear::new(format!("{p}.self_attn.q_proj"), mk(&mut rng, qo, d), bias(&mut rng, qo)),
                         k_proj: Linear::new(format!("{p}.self_attn.k_proj"), mk(&mut rng, kvo, d), bias(&mut rng, kvo)),
                         v_proj: Linear::new(format!("{p}.self_attn.v_proj"), mk(&mut rng, kvo, d), bias(&mut rng, kvo)),
-                        o_proj: Linear::new(
-                            format!("{p}.self_attn.o_proj"),
-                            mk(&mut rng, d, a.n_heads * a.head_dim),
-                            None,
-                        ),
+                        o_proj: Linear::new(format!("{p}.self_attn.o_proj"), mk(&mut rng, d, a.n_heads * a.head_dim), None),
                         q_norm: a.qk_norm.then(|| norm(&mut rng, a.head_dim, off)),
                         k_norm: a.qk_norm.then(|| norm(&mut rng, a.head_dim, off)),
                         eps: cfg.rms_eps,
@@ -339,22 +312,14 @@ impl Model {
                     let nv = dc.n_v_heads;
                     Mixer::Delta(DeltaNet {
                         in_proj_qkv: Linear::new(format!("{p}.linear_attn.in_proj_qkv"), mk(&mut rng, cd, d), None),
-                        in_proj_z: Linear::new(
-                            format!("{p}.linear_attn.in_proj_z"),
-                            mk(&mut rng, dc.value_dim(), d),
-                            None,
-                        ),
+                        in_proj_z: Linear::new(format!("{p}.linear_attn.in_proj_z"), mk(&mut rng, dc.value_dim(), d), None),
                         in_proj_b: Linear::new(format!("{p}.linear_attn.in_proj_b"), mk(&mut rng, nv, d), None),
                         in_proj_a: Linear::new(format!("{p}.linear_attn.in_proj_a"), mk(&mut rng, nv, d), None),
                         conv_w: rng.vec_normal(cd * dc.conv_kernel, 0.4),
                         dt_bias: rng.vec_normal(nv, 0.5),
                         a_log: (0..nv).map(|_| (1.0 + rng.uniform() * 3.0).ln() - 1.0).collect(),
                         norm_w: norm(&mut rng, dc.v_head_dim, 0.0),
-                        out_proj: Linear::new(
-                            format!("{p}.linear_attn.out_proj"),
-                            mk(&mut rng, d, dc.value_dim()),
-                            None,
-                        ),
+                        out_proj: Linear::new(format!("{p}.linear_attn.out_proj"), mk(&mut rng, d, dc.value_dim()), None),
                         eps: cfg.rms_eps,
                         cfg: dc,
                     })
@@ -404,11 +369,7 @@ impl Model {
     }
 
     pub fn lora_linears_mut(&mut self) -> Vec<&mut Linear> {
-        self.blocks
-            .iter_mut()
-            .flat_map(|b| b.linears_mut())
-            .filter(|l| l.lora.is_some())
-            .collect()
+        self.blocks.iter_mut().flat_map(|b| b.linears_mut()).filter(|l| l.lora.is_some()).collect()
     }
     pub fn lora_linears(&self) -> Vec<&Linear> {
         self.blocks.iter().flat_map(|b| b.linears()).filter(|l| l.lora.is_some()).collect()

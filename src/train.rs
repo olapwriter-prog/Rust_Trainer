@@ -183,15 +183,11 @@ impl<'m> Trainer<'m> {
         let mut rng = Rng::new(cfg.seed ^ 0xD1CE);
         let mut order: Vec<usize> = (0..data.len()).collect();
         rng.shuffle(&mut order);
-        let steps_per_epoch = (data.len() + cfg.batch_size - 1) / cfg.batch_size;
+        let steps_per_epoch = data.len().div_ceil(cfg.batch_size);
         let total_steps = (steps_per_epoch * cfg.epochs) as u64;
         let opt = AdamW::new(AdamWConfig { weight_decay: cfg.weight_decay, ..Default::default() }, model);
-        let sched = Schedule {
-            peak_lr: cfg.lr,
-            warmup_steps: cfg.warmup_steps.min(total_steps / 2),
-            total_steps,
-            min_ratio: cfg.min_lr_ratio,
-        };
+        let sched =
+            Schedule { peak_lr: cfg.lr, warmup_steps: cfg.warmup_steps.min(total_steps / 2), total_steps, min_ratio: cfg.min_lr_ratio };
         let state = TrainState {
             step: 0,
             total_steps,
