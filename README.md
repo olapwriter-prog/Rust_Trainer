@@ -25,7 +25,7 @@ agentd ctl learn ──► confirmed.jsonl ──► rust_trainer run ───�
 | Confirmed-only data, exact pause/resume, eval gate, swap, keep-5 rollback, ledger, Deep/charging/battery/heat policy with hysteresis | ✅ tested; end-to-end CLI run in CI |
 | **Mixture of LoRA experts** (`--experts K`): skill grouping (labels or clustering), branch-trained experts, TF-IDF router, per-expert gate | ✅ tested; routing recipe for the engine in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md#6-mixture-of-experts-bundles) |
 | **Open-source sandbox**: real Qwen3-0.6B GGUF (Docker model catalog), SNIPS requests → actions, phone-night simulator (stage, charging, battery, CPU-driven thermal model, unplug), exact-action eval | ✅ [`docs/SANDBOX.md`](docs/SANDBOX.md); found and fixed two heat-limit overshoots |
-| `agentd` side (status file, launch, reload) | ⏳ `agenticOS` is still empty; contract in [`docs/AGENTD.md`](docs/AGENTD.md) |
+| **agentd drop-in** (`rust_trainer train -m … --data learn/sft.jsonl --grammar … --out adapter.new.lora --steps N --max-seconds S`): agentd's real job protocol, AGLORA1 adapters served unchanged by `agentos-llm --lora` | ✅ verified with agentd's real export on Qwen3-0.6B: agentos-llm's held-out score 4.2 % → 25 % with our adapter; agentd needs one config key to launch it ([`docs/AGENTD.md`](docs/AGENTD.md)) |
 | Engine side (load and apply `adapter.gguf`) | ⏳ in the engine's own session; spec and acceptance test in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md) |
 | Measured improvement on held-out requests with a real model (plan step 3) | ✅ in the sandbox: real Qwen3-0.6B Q4_0, one simulated night, 140 open-dataset requests → exact action 0 % → 42.9 %, intent 0 % → 97.6 % on 42 unseen requests. ⏳ on your own corrections |
 | Parity of the HF/Qwen3.5 path with `transformers` + `peft` | ⏳ harness in `tools/parity.py`, not yet run (no PyTorch here) |
@@ -51,6 +51,8 @@ rust_trainer eval     --model M.gguf --adapter DIR --data confirmed.jsonl      #
 rust_trainer run      --model M.gguf --data confirmed.jsonl --status /run/agentd/device.json --hours 7
 rust_trainer run      --model M.gguf … --experts 4                 # mixture of experts instead of one adapter
 rust_trainer route    --model M.gguf --prompt "dim the hall lamp"   # which expert a request goes to
+rust_trainer train    -m M.gguf --data learn/sft.jsonl --grammar learn/grammar.gbnf \
+                      --out learn/adapter.new.lora --steps 60 --max-seconds 1800  # agentd's job (drop-in for agentos-llm train)
 rust_trainer status   --model M.gguf
 rust_trainer rollback --model M.gguf --reason "user asked"
 rust_trainer synth    --out m.gguf --arch qwen3 --wtype Q4_0       # random-weight GGUF (or --preset qwen3-0.6b;

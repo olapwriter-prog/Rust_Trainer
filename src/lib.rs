@@ -13,6 +13,7 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 pub mod adapter;
+pub mod agentd;
 pub mod attention;
 pub mod data;
 pub mod deltanet;

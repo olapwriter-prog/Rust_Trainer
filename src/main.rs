@@ -4,6 +4,8 @@
 //! rust_trainer toy      [--arch hybrid|dense] [--steps N]
 //! rust_trainer info     --model DIR [--rank R]
 //! rust_trainer train    --model DIR --data FILE --out DIR [--ckpt FILE] [options]
+//! rust_trainer train    -m M.gguf --data sft.jsonl --grammar G --out adapter.new.lora --steps N [--max-seconds S]
+//!                       (agentd's job protocol; drop-in for `agentos-llm train`)
 //! rust_trainer eval     --model DIR --adapter DIR --data FILE [options]
 //! rust_trainer run      --model DIR --data FILE --status FILE [--hours H] [--poll-secs S] [options]
 //! rust_trainer rollback --model DIR [--reason TEXT]
@@ -47,6 +49,12 @@ impl Args {
         let mut i = 0;
         while i < rest.len() {
             let a = &rest[i];
+            // agentd / agentos-llm style short options
+            let a: &str = match a.as_str() {
+                "-m" => "--model",
+                "-t" => "--threads",
+                other => other,
+            };
             let key = a.strip_prefix("--").ok_or_else(|| format!("unexpected argument {a}"))?;
             if i + 1 < rest.len() && !rest[i + 1].starts_with("--") {
                 kv.insert(key.to_string(), rest[i + 1].clone());
@@ -335,7 +343,53 @@ fn log_line(s: &str) {
     eprintln!("{s}");
 }
 
+/// agentd's training job (`train -m M --data sft.jsonl --grammar G --out adapter.new.lora
+/// --steps N --max-seconds S`): progress on stderr, one JSON summary line on stdout.
+#[cfg(feature = "rie")]
+fn cmd_train_agentd(a: &Args) -> Result<(), String> {
+    use rust_trainer::agentd::{run, AgentdJob, Encoders};
+    let loaded = load(a)?;
+    let Some((tok, _)) = &loaded.engine else { return Err("agentd jobs need a GGUF model".into()) };
+    let grammar = match a.get("grammar") {
+        Some(p) => Some(std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?),
+        None => None,
+    };
+    let d = AgentdJob::default();
+    let job = AgentdJob {
+        data: PathBuf::from(a.req("data")?),
+        out: PathBuf::from(a.req("out")?),
+        grammar,
+        steps: a.num("steps", d.steps)?,
+        batch: a.num("batch", d.batch)?,
+        rank: a.num("rank", d.rank)?,
+        alpha: a.num("alpha", d.alpha)?,
+        lr: a.num("lr", d.lr)?,
+        holdout: a.num("holdout", d.holdout)?,
+        max_secs: a.get("max-seconds").map(|s| s.parse().map_err(|_| "--max-seconds")).transpose()?,
+        max_len: a.num("max-len", d.max_len)?,
+    };
+    let tk = tok.clone();
+    let tk2 = tok.clone();
+    let prompt = move |s: &str| tk.encode(s, true, true);
+    let text = move |s: &str| tk2.encode(s, false, false);
+    let im_end = tok.token_id("<|im_end|>").ok_or("the model's vocabulary has no <|im_end|>")?;
+    let enc = Encoders { prompt: &prompt, text: &text, im_end };
+    let mut model = loaded.model;
+    let out = run(&mut model, &enc, &job, &mut |line| eprintln!("rust_trainer train: {line}")).map_err(|e| e.to_string())?;
+    println!("{out}");
+    Ok(())
+}
+
+#[cfg(not(feature = "rie"))]
+fn cmd_train_agentd(_a: &Args) -> Result<(), String> {
+    Err("agentd jobs need the `rie` feature".into())
+}
+
 fn cmd_train(a: &Args) -> Result<(), String> {
+    // agentd launches `train -m MODEL --data … --grammar … --out … --steps N --max-seconds S`.
+    if a.get("steps").is_some() || a.get("grammar").is_some() {
+        return cmd_train_agentd(a);
+    }
     let loaded = load(a)?;
     let cfg = train_config(a)?;
     let p = prepare(a, &loaded, &cfg)?;
