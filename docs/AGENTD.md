@@ -47,10 +47,13 @@ The test used agentd's real export (`cargo run -p agentd --example prompt -- cra
 * **Launch 2:** printed "continuing from step 2", trained to step 12, judged 29 %, printed `"kept":true`, and wrote `adapter.new.lora` (AGLORA1, 9.2 MB) and `adapter.new.gguf`.
 * **agentd's own engine** loaded it: `agentos-llm --lora adapter.new.lora` reported "2293760 parameters". On agentd's 12 held-out requests, with agentd's grammar and scoring (`tools/agentos_judge.py`):
 
-| agentos-llm, Qwen3-0.6B Q4_0 | score |
+| agentos-llm, Qwen3-0.6B Q4_0 | score on 12 held-out requests |
 |---|---|
 | no adapter | 4.2 % |
-| adapter from `rust_trainer train`, 12 steps | **25 %** |
+| adapter from `rust_trainer train`, 12 steps (24 example passes) | 25 % |
+| adapter from `rust_trainer train`, 30 steps of batch 2 (as agentos-llm's own trainer was measured), in 3 time-boxed launches like agentd's nights | **75 %** |
+
+The 30-step adapter answers 8 of 12 held-out requests exactly and picks the right tool for 11 of 12; the remaining misses are argument details. `rust_trainer`'s own judge (unconstrained greedy) also gave 75 %, the same as agentd's grammar-constrained judge on agentos-llm. For reference, agenticOS's notes record its own trainer taking Qwen2.5-0.5B from 46 % to 67 % with the same step count (a different base model, so not directly comparable).
 
 `tests/agentd.rs` checks the protocol on a synthetic GGUF: a time-boxed launch, then a resumed launch that is **bit-identical** to an uninterrupted job. It also checks that the base score is carried over, the checkpoint is removed at the end, and the AGLORA1 round-trip reproduces the trained model exactly.
 
