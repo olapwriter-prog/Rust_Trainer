@@ -43,35 +43,62 @@ pub struct EvalReport {
     pub reason: String,
 }
 
-/// Measure the model as currently configured (adapters on or off as set).
-pub fn measure(model: &Model, sft: &[Example], pref: &[PrefPair]) -> (Metrics, usize) {
-    let mut nll = 0.0f64;
-    let mut correct = 0usize;
-    let mut tokens = 0usize;
+/// Additive evaluation totals, so results over several groups (e.g. one per
+/// expert of a mixture) can be combined exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sums {
+    pub nll: f64,
+    pub hits: usize,
+    pub tokens: usize,
+    pub pref_wins: usize,
+    pub pref_n: usize,
+}
+
+impl Sums {
+    pub fn add(&mut self, o: &Sums) {
+        self.nll += o.nll;
+        self.hits += o.hits;
+        self.tokens += o.tokens;
+        self.pref_wins += o.pref_wins;
+        self.pref_n += o.pref_n;
+    }
+    pub fn metrics(&self) -> Metrics {
+        let t = self.tokens.max(1) as f64;
+        Metrics {
+            nll: (self.nll / t) as f32,
+            accuracy: (self.hits as f64 / t) as f32,
+            pref_accuracy: (self.pref_n > 0).then(|| self.pref_wins as f32 / self.pref_n as f32),
+        }
+    }
+}
+
+/// Totals for the model as currently configured (adapters on or off as set).
+pub fn measure_sums(model: &Model, sft: &[Example], pref: &[PrefPair]) -> Sums {
+    let mut s = Sums::default();
     for ex in sft {
         let targets = answer_targets(&ex.tokens, ex.answer_start);
         if targets.is_empty() {
             continue;
         }
         let (lp, acc) = logprobs_and_hits(model, &ex.tokens, &targets);
-        nll -= lp.iter().map(|v| *v as f64).sum::<f64>();
-        correct += acc;
-        tokens += targets.len();
+        s.nll -= lp.iter().map(|v| *v as f64).sum::<f64>();
+        s.hits += acc;
+        s.tokens += targets.len();
     }
-    let pref_accuracy = if pref.is_empty() {
-        None
-    } else {
-        let wins = pref
-            .iter()
-            .filter(|p| {
-                let s = |e: &Example| model.logprobs(&e.tokens, &answer_targets(&e.tokens, e.answer_start)).iter().sum::<f32>();
-                s(&p.chosen) > s(&p.rejected)
-            })
-            .count();
-        Some(wins as f32 / pref.len() as f32)
-    };
-    let t = tokens.max(1) as f64;
-    (Metrics { nll: (nll / t) as f32, accuracy: correct as f32 / t as f32, pref_accuracy }, tokens)
+    for p in pref {
+        let sc = |e: &Example| model.logprobs(&e.tokens, &answer_targets(&e.tokens, e.answer_start)).iter().sum::<f32>();
+        if sc(&p.chosen) > sc(&p.rejected) {
+            s.pref_wins += 1;
+        }
+        s.pref_n += 1;
+    }
+    s
+}
+
+/// Measure the model as currently configured (adapters on or off as set).
+pub fn measure(model: &Model, sft: &[Example], pref: &[PrefPair]) -> (Metrics, usize) {
+    let s = measure_sums(model, sft, pref);
+    (s.metrics(), s.tokens)
 }
 
 fn logprobs_and_hits(model: &Model, tokens: &[u32], targets: &[crate::model::Target]) -> (Vec<f32>, usize) {

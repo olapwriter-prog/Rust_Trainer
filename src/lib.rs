@@ -21,6 +21,7 @@ pub mod frozen;
 pub mod hf;
 pub mod linear;
 pub mod model;
+pub mod moe;
 pub mod ops;
 pub mod optim;
 pub mod registry;

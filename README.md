@@ -23,6 +23,7 @@ agentd ctl learn ──► confirmed.jsonl ──► rust_trainer run ───�
 | Backward through Qwen3.5: zero-centred RMSNorm, partial RoPE, gated attention, **Gated DeltaNet with BPTT** | ✅ gradient-checked (HF safetensors path; the engine has no Qwen3.5 yet) |
 | Training loop: AdamW, warm-up + cosine LR, clipping, answer-token loss, activation recomputation, chunked BPTT state checkpoints; DPO on corrections | ✅ |
 | Confirmed-only data, exact pause/resume, eval gate, swap, keep-5 rollback, ledger, Deep/charging/battery/heat policy with hysteresis | ✅ tested; end-to-end CLI run in CI |
+| **Mixture of LoRA experts** (`--experts K`): skill grouping (labels or clustering), branch-trained experts, TF-IDF router, per-expert gate | ✅ tested; routing recipe for the engine in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md#6-mixture-of-experts-bundles) |
 | `agentd` side (status file, launch, reload) | ⏳ `agenticOS` is still empty; contract in [`docs/AGENTD.md`](docs/AGENTD.md) |
 | Engine side (load and apply `adapter.gguf`) | ⏳ in the engine's own session; spec and acceptance test in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md) |
 | Measured improvement on real held-out corrections (plan step 3) | ⏳ needs a real GGUF and real confirmed data (Hugging Face downloads are blocked in this sandbox) |
@@ -47,6 +48,8 @@ rust_trainer info     --model qwen3-4b-q4_0.gguf                  # sizes, adapt
 rust_trainer train    --model M.gguf --data confirmed.jsonl --out M.adapters/manual
 rust_trainer eval     --model M.gguf --adapter DIR --data confirmed.jsonl      # DIR may hold only adapter.gguf
 rust_trainer run      --model M.gguf --data confirmed.jsonl --status /run/agentd/device.json --hours 7
+rust_trainer run      --model M.gguf … --experts 4                 # mixture of experts instead of one adapter
+rust_trainer route    --model M.gguf --prompt "dim the hall lamp"   # which expert a request goes to
 rust_trainer status   --model M.gguf
 rust_trainer rollback --model M.gguf --reason "user asked"
 rust_trainer synth    --out m.gguf --arch qwen3 --wtype Q4_0       # random-weight GGUF (or --preset qwen3-0.6b;
@@ -106,6 +109,39 @@ The candidate must beat the **current** model (base plus active adapter) on held
 * there must be at least 8 examples.
 
 Otherwise the candidate is deleted. The last 5 accepted adapters are kept, and `rollback` walks back to the base model. Every transition is a ledger line. The registry lives next to the model: `model.adapters/` beside `model.gguf`, or `<dir>/adapters/` for an HF directory.
+
+## 4b. Mixture of experts, on your data alone
+
+With `--experts K`, a night produces specialists instead of one adapter that has to cover everything:
+
+1. **Group:** confirmed examples are grouped by skill. The exporter's `skill`/`task`/`tool` label is used when present; otherwise the trainer clusters your requests with cosine k-means.
+2. **General first:** a *general* expert trains on all your data. It also answers anything the router is unsure about.
+3. **Branch-train:** every skill group with enough examples gets an expert, initialised from the general one and specialised on that group.
+4. **Route:** a router picks the expert per request using hashed TF-IDF over the prompt's tokens and token pairs. Chat-template tokens get zero weight. No forward pass is needed, and the engine can reproduce it exactly.
+5. **Gate twice:**
+   * each expert is kept only if it beats the general expert on *its own* held-out requests;
+   * the routed mixture must beat the current model (base, adapter or previous mixture) through the normal gate.
+
+   Experts can be dropped individually, and the whole bundle rolls back like any adapter.
+
+This is a mixture of *adapters* on the frozen base, not a conversion of the base into a sparse MoE. Training per-layer routers and experts inside the model would need far more data and compute than a phone and a few hundred examples provide.
+
+**Measured** on a synthetic Q4_0 Qwen3 through the engine, with 240 confirmed examples across 3 skills (home control, arithmetic, messages) and 20 % held out:
+
+| | held-out NLL | answer accuracy |
+|---|---|---|
+| base | 6.48 | 0.1 % |
+| single adapter, 3 epochs | 0.99 | 75.1 % |
+| single adapter, 6 epochs (same compute as the mixture) | **0.48** | **87.5 %** |
+| mixture (general + 3 experts), r = 4 | 0.49 | 85.3 % |
+| single adapter, r = 1, same compute | 1.47 | 67.8 % |
+| mixture, r = 1 | **1.41** | **68.5 %** |
+
+Routing put unseen requests in the right group ≥ 90 % of the time without any labels.
+
+At equal compute the mixture matched a single adapter when the adapter had room for all skills (r = 4). It was about 4 % better when capacity was tight (r = 1). Expect gains when your skills pull the model in different directions; otherwise the gate keeps whichever is better.
+
+Before branch-training, skill experts trained from scratch saw only a third of the steps, and the per-expert gate dropped 2 of 3. Starting them from the general expert fixed that.
 
 ## 5. Never touches the approval rules
 

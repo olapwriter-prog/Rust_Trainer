@@ -34,6 +34,9 @@ pub struct SftRecord {
     pub prompt: Text,
     pub response: Text,
     pub split: Option<String>,
+    /// Skill label from the exporter (`skill`/`task`/`domain`/`category`/`tool`),
+    /// used to group examples into experts.
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +47,7 @@ pub struct PrefRecord {
     pub chosen: Text,
     pub rejected: Text,
     pub split: Option<String>,
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,24 +130,29 @@ impl Dataset {
         let id =
             v.get("id").map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).unwrap_or_else(|| format!("line{ln}"));
         let split = v.get("split").and_then(Value::as_str).map(str::to_string);
+        let label = ["skill", "task", "domain", "category", "tool"]
+            .iter()
+            .find_map(|k| v.get(*k).and_then(Value::as_str))
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty());
         let mut system = v.get("system").and_then(Value::as_str).map(str::to_string);
         let prompt = text_field(v, &["prompt", "input", "request"]);
 
         let chosen = text_field(v, &["chosen", "corrected"]);
         let rejected = text_field(v, &["rejected", "original", "model_output"]);
         if let (Some(p), Some(c), Some(r)) = (prompt.clone(), chosen.clone(), rejected) {
-            self.pref.push(PrefRecord { id, system, prompt: p, chosen: c, rejected: r, split });
+            self.pref.push(PrefRecord { id, system, prompt: p, chosen: c, rejected: r, split, label });
             return;
         }
         let response = text_field(v, &["response", "answer", "completion", "corrected", "chosen"]);
         match (prompt, response) {
-            (Some(p), Some(r)) => self.sft.push(SftRecord { id, system, prompt: p, response: r, split }),
+            (Some(p), Some(r)) => self.sft.push(SftRecord { id, system, prompt: p, response: r, split, label }),
             _ => match from_messages(v) {
                 Some((s, p, r)) => {
                     if system.is_none() {
                         system = s;
                     }
-                    self.sft.push(SftRecord { id, system, prompt: p, response: r, split })
+                    self.sft.push(SftRecord { id, system, prompt: p, response: r, split, label })
                 }
                 None => self.dropped_malformed += 1,
             },
@@ -219,6 +228,8 @@ mod tests {
         assert_eq!(ds.dropped_unconfirmed, 3);
         assert_eq!(ds.sft[1].system.as_deref(), Some("s"));
         assert_eq!(ds.sft[1].prompt, Text::Str("u".into()));
+        ds.push_value(&json!({"id":"g","prompt":"p","response":"r","confirmed":true,"skill":" Home "}), 6);
+        assert_eq!(ds.sft[2].label.as_deref(), Some("home"));
     }
 
     #[test]

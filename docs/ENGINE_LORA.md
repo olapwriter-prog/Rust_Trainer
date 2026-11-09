@@ -84,3 +84,43 @@ With both crates in one workspace or as dev-dependencies:
 1. Build a synthetic model (`SyntheticSpec::tiny("qwen3", Q4_0)`).
 2. Train a few steps with `rust_trainer`, then `write_gguf_adapter`.
 3. Load the model in the engine with the adapter, run `forward(all_logits)`, and compare with `rust_trainer::model::Model::logprobs` on the same tokens. The result should be bit-identical, as it already is without an adapter.
+
+## 6. Mixture of experts (bundles)
+
+When the night produced a mixture, `ACTIVE` names a **bundle**: an adapter directory containing `router.json`.
+
+```
+<id>/router.json
+<id>/experts/<name>/adapter.gguf      one per expert, same format as above
+```
+
+Check with `exists(<id>/router.json)`. Without it, the directory is a single adapter (§2).
+
+### Routing recipe (`"feature": "tfidf_hash_v1"`)
+
+The input is the prompt token ids exactly as `Engine::chat` builds them: `template.render(messages, true)` encoded with BOS and special-token parsing. The trainer routes on the same tokens.
+
+```text
+mix64(z):  z += 0x9E3779B97F4A7C15
+           z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+           z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+           return z ^ (z >> 31)                          (all wrapping u64)
+
+count[b] for each token t:          b = mix64(t)                              % dim
+         for each adjacent (a, c):  b = mix64(1<<63 | a<<32 | c)              % dim
+v[b]   = (1 + ln count[b]) * idf[b]        (0 where count is 0)
+v      = v / |v|₂
+s_i    = v · centroids[i]
+i*     = argmax s_i
+expert = (s_{i*} >= min_similarity) ? (experts[i*] ?? fallback) : fallback
+```
+
+`fallback` = `null` means the base model with no adapter.
+
+The router fields are `dim`, `idf[dim]`, `centroids[k][dim]`, `names[k]`, `experts[k]` (a name or `null`), `fallback` and `min_similarity`. `rust_trainer::moe::Router::route` is the reference implementation. `rust_trainer route --model M.gguf --prompt "…"` prints the decision for a prompt.
+
+### Serving
+
+* **Route once per conversation.** Do it on the first user turn (system + first message) and keep that expert for the rest of the conversation. Switching experts mid-conversation invalidates the KV cache, because K and V depend on the adapter.
+* **Keep experts loaded.** Each is a few MB to a few tens of MB (r = 8 on a 4B model ≈ 60 MB in F32). Keep them all in memory, or load on first use.
+* **Applying the chosen expert:** identical to §3.

@@ -8,6 +8,7 @@
 //! rust_trainer run      --model DIR --data FILE --status FILE [--hours H] [--poll-secs S] [options]
 //! rust_trainer rollback --model DIR [--reason TEXT]
 //! rust_trainer status   --model DIR
+//! rust_trainer route    --model M.gguf --prompt TEXT [--adapter BUNDLE]   (mixture: which expert)
 //! rust_trainer synth    --out FILE.gguf [--arch qwen3 | --preset qwen3-0.6b] [--wtype Q4_0]
 //! ```
 //! Options: `--rank 8 --alpha 16 --lr 2e-4 --epochs 2 --batch 4 --max-len 512
@@ -19,8 +20,9 @@ use rust_trainer::data::{Dataset, Text};
 use rust_trainer::eval::{evaluate_vs_base, GateConfig};
 use rust_trainer::hf::{estimate, load_model, LoadOptions};
 use rust_trainer::model::{Model, ModelConfig, DEFAULT_TARGETS};
+use rust_trainer::moe::{is_bundle, load_router, measure_current, Current, MoeConfig};
 use rust_trainer::registry::{now_unix, Registry};
-use rust_trainer::scheduler::{run_overnight, FileMonitor, Heldout, JobConfig, PowerPolicy};
+use rust_trainer::scheduler::{run_overnight, run_overnight_moe, FileMonitor, Heldout, JobConfig, PowerPolicy};
 use rust_trainer::tokenizer::{ByteTokenizer, ChatFormat, ChatMl, Example, Formatter, Tokenizer};
 use rust_trainer::train::{Objective, PrefPair, RunToEnd, TrainConfig, TrainData, Trainer};
 use std::collections::HashMap;
@@ -73,7 +75,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: rust_trainer <toy|info|train|eval|run|rollback|status|synth> [--options]  (see README.md)".to_string()
+    "usage: rust_trainer <toy|info|train|eval|run|route|rollback|status|synth> [--options]  (see README.md)".to_string()
 }
 
 fn main() -> ExitCode {
@@ -92,6 +94,7 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args),
         "rollback" => cmd_rollback(&args),
         "status" => cmd_status(&args),
+        "route" => cmd_route(&args),
         #[cfg(feature = "rie")]
         "synth" => cmd_synth(&args),
         _ => Err(usage()),
@@ -208,19 +211,29 @@ fn any_raw_text(ds: &Dataset) -> bool {
         || ds.pref.iter().any(|r| needs_tokenizer(&r.prompt) || needs_tokenizer(&r.chosen) || needs_tokenizer(&r.rejected))
 }
 
-fn build_examples(ds: &Dataset, fmt: &dyn Formatter) -> (Vec<Example>, Vec<PrefPair>) {
-    let sft = ds.sft.iter().filter_map(|r| fmt.example(r.system.as_deref(), &r.prompt, &r.response)).collect();
-    let pref = ds
+/// Tokenised examples with their skill labels (for the mixture of experts).
+struct Built {
+    sft: Vec<Example>,
+    sft_labels: Vec<Option<String>>,
+    pref: Vec<PrefPair>,
+    pref_labels: Vec<Option<String>>,
+}
+
+fn build_examples(ds: &Dataset, fmt: &dyn Formatter) -> Built {
+    let (sft, sft_labels) =
+        ds.sft.iter().filter_map(|r| Some((fmt.example(r.system.as_deref(), &r.prompt, &r.response)?, r.label.clone()))).unzip();
+    let (pref, pref_labels) = ds
         .pref
         .iter()
         .filter_map(|r| {
-            Some(PrefPair {
+            let pair = PrefPair {
                 chosen: fmt.example(r.system.as_deref(), &r.prompt, &r.chosen)?,
                 rejected: fmt.example(r.system.as_deref(), &r.prompt, &r.rejected)?,
-            })
+            };
+            Some((pair, r.label.clone()))
         })
-        .collect();
-    (sft, pref)
+        .unzip();
+    Built { sft, sft_labels, pref, pref_labels }
 }
 
 fn default_prefix(m: &Model) -> &'static str {
@@ -233,6 +246,7 @@ fn default_prefix(m: &Model) -> &'static str {
 
 struct Prepared {
     train: TrainData,
+    train_labels: Vec<Option<String>>,
     held_sft: Vec<Example>,
     held_pref: Vec<PrefPair>,
     n_train: usize,
@@ -283,19 +297,20 @@ fn prepare(a: &Args, loaded: &Loaded, cfg: &TrainConfig) -> Result<Prepared, Str
             &chatml
         }
     };
-    let (tr_sft, tr_pref) = build_examples(&train, fmt);
-    let (held_sft, held_pref) = build_examples(&held, fmt);
+    let tr = build_examples(&train, fmt);
+    let he = build_examples(&held, fmt);
+    let (tr_sft, tr_pref, held_sft, held_pref) = (tr.sft, tr.pref, he.sft, he.pref);
     for ex in tr_sft.iter().chain(&held_sft) {
         if let Some(&t) = ex.tokens.iter().find(|&&t| t as usize >= model.cfg.vocab_size) {
             return Err(format!("token id {t} exceeds the model vocab {}", model.cfg.vocab_size));
         }
     }
-    let train = match cfg.objective {
-        Objective::Sft => TrainData::Sft(tr_sft),
-        Objective::Dpo { .. } => TrainData::Pref(tr_pref),
+    let (train, train_labels) = match cfg.objective {
+        Objective::Sft => (TrainData::Sft(tr_sft), tr.sft_labels),
+        Objective::Dpo { .. } => (TrainData::Pref(tr_pref), tr.pref_labels),
     };
     let n_train = train.len();
-    Ok(Prepared { train, held_sft, held_pref, n_train })
+    Ok(Prepared { train, train_labels, held_sft, held_pref, n_train })
 }
 
 /// Load an adapter directory: PEFT safetensors, or only `adapter.gguf` (e.g. from llama.cpp).
@@ -364,8 +379,16 @@ fn cmd_eval(a: &Args) -> Result<(), String> {
     let cfg = TrainConfig::default();
     let p = prepare(a, &loaded, &cfg)?;
     let mut model = loaded.model;
-    load_adapter_dir(&mut model, a.req("adapter")?)?;
-    let rep = evaluate_vs_base(&mut model, &gate_config(a)?, &p.held_sft, &p.held_pref);
+    let dir = a.req("adapter")?;
+    let rep = if is_bundle(dir) {
+        let cur = Current::from_dir(Some(PathBuf::from(dir))).map_err(|e| e.to_string())?;
+        let base = measure_current(&mut model, &Current::Base, &p.held_sft, &p.held_pref).map_err(|e| e.to_string())?;
+        let cand = measure_current(&mut model, &cur, &p.held_sft, &p.held_pref).map_err(|e| e.to_string())?;
+        rust_trainer::eval::gate(&gate_config(a)?, &base.metrics(), &cand.metrics(), p.held_sft.len() + p.held_pref.len(), cand.tokens)
+    } else {
+        load_adapter_dir(&mut model, dir)?;
+        evaluate_vs_base(&mut model, &gate_config(a)?, &p.held_sft, &p.held_pref)
+    };
     println!("{}", serde_json::to_string_pretty(&rep).unwrap());
     Ok(())
 }
@@ -394,16 +417,20 @@ fn cmd_run(a: &Args) -> Result<(), String> {
         true
     };
     let mut log = |s: &str| eprintln!("{s}");
-    let outcome = run_overnight(
-        &mut model,
-        &registry,
-        &job,
-        p.train,
-        Heldout { sft: &p.held_sft, pref: &p.held_pref },
-        &mut monitor,
-        &mut wait,
-        &mut log,
-    )
+    let heldout = Heldout { sft: &p.held_sft, pref: &p.held_pref };
+    let experts: usize = a.num("experts", 1)?;
+    let outcome = if experts > 1 {
+        let moe = MoeConfig {
+            max_experts: experts,
+            min_expert_examples: a.num("min-expert-examples", 24)?,
+            general_expert: !a.flag("no-general"),
+            min_similarity: a.num("min-similarity", 0.1)?,
+            ..Default::default()
+        };
+        run_overnight_moe(&mut model, &registry, &job, &moe, p.train, &p.train_labels, heldout, &mut monitor, &mut wait, &mut log)
+    } else {
+        run_overnight(&mut model, &registry, &job, p.train, heldout, &mut monitor, &mut wait, &mut log)
+    }
     .map_err(|e| e.to_string())?;
     println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
     Ok(())
@@ -420,6 +447,13 @@ fn cmd_status(a: &Args) -> Result<(), String> {
     let r = Registry::open(a.req("model")?).map_err(|e| e.to_string())?;
     println!("active:   {}", r.active().as_deref().unwrap_or("(base model)"));
     println!("accepted: {:?}", r.accepted());
+    if let Some(dir) = r.active_dir().filter(|d| is_bundle(d)) {
+        let router = load_router(&dir).map_err(|e| e.to_string())?;
+        println!("mixture:  fallback = {}", router.fallback.as_deref().unwrap_or("(base model)"));
+        for (g, e) in router.names.iter().zip(&router.experts) {
+            println!("          {g:<16} → {}", e.as_deref().unwrap_or("fallback"));
+        }
+    }
     if let Ok(s) = std::fs::read_to_string(r.work_dir().join("status.json")) {
         println!("run:      {}", s.trim());
     }
@@ -427,6 +461,33 @@ fn cmd_status(a: &Args) -> Result<(), String> {
         println!("  {} {:<9} {:<14} {}", e.ts, e.event, e.adapter.as_deref().unwrap_or("-"), e.detail);
     }
     Ok(())
+}
+
+/// Show which expert of a mixture a prompt is routed to (GGUF models).
+#[cfg(feature = "rie")]
+fn cmd_route(a: &Args) -> Result<(), String> {
+    let loaded = load(a)?;
+    let dir = match a.get("adapter") {
+        Some(d) => PathBuf::from(d),
+        None => Registry::open(a.req("model")?).map_err(|e| e.to_string())?.active_dir().ok_or("no active adapter")?,
+    };
+    if !is_bundle(&dir) {
+        return Err(format!("{} is a single adapter, not a mixture", dir.display()));
+    }
+    let router = load_router(&dir).map_err(|e| e.to_string())?;
+    let Some((tok, template)) = &loaded.engine else { return Err("route needs a GGUF model".into()) };
+    let fmt = rust_trainer::rie::EngineChat::new(tok.clone(), *template, 1 << 20).map_err(|e| e.to_string())?;
+    let tokens = fmt.prompt_tokens(a.get("system"), &Text::Str(a.req("prompt")?.to_string()));
+    let r = router.route(&tokens);
+    let group = r.group.map(|g| router.names[g].clone()).unwrap_or_else(|| "(unsure)".into());
+    let expert = r.expert.clone().unwrap_or_else(|| "(base model)".into());
+    println!("{}", serde_json::json!({"group": group, "similarity": r.similarity, "expert": expert}));
+    Ok(())
+}
+
+#[cfg(not(feature = "rie"))]
+fn cmd_route(_a: &Args) -> Result<(), String> {
+    Err("route needs a GGUF model (build with the `rie` feature)".into())
 }
 
 fn cmd_info(a: &Args) -> Result<(), String> {
