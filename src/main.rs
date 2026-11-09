@@ -474,6 +474,15 @@ fn cmd_synth(a: &Args) -> Result<(), String> {
         None => SyntheticSpec::tiny(a.get("arch").unwrap_or("qwen3"), wtype),
     };
     spec.seed = a.num("seed", 1)?;
+    // Shape overrides, e.g. Qwen3-8B: --preset qwen3-4b --layers 36 --hidden 4096 --ff 12288
+    spec.n_layer = a.num("layers", spec.n_layer)?;
+    spec.n_embd = a.num("hidden", spec.n_embd)?;
+    spec.n_head = a.num("heads", spec.n_head)?;
+    spec.n_head_kv = a.num("kv-heads", spec.n_head_kv)?;
+    spec.head_dim = a.num("head-dim", spec.head_dim)?;
+    spec.rope_dim = a.num("head-dim", spec.rope_dim)?;
+    spec.n_ff = a.num("ff", spec.n_ff)?;
+    spec.n_vocab = a.num("vocab", spec.n_vocab)?;
     let out = a.req("out")?;
     std::fs::write(out, spec.build()).map_err(|e| e.to_string())?;
     eprintln!("wrote {out}: {} {:?}, {} layers, hidden {}", spec.arch, spec.wtype, spec.n_layer, spec.n_embd);

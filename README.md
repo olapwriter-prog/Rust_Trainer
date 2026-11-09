@@ -49,7 +49,8 @@ rust_trainer eval     --model M.gguf --adapter DIR --data confirmed.jsonl      #
 rust_trainer run      --model M.gguf --data confirmed.jsonl --status /run/agentd/device.json --hours 7
 rust_trainer status   --model M.gguf
 rust_trainer rollback --model M.gguf --reason "user asked"
-rust_trainer synth    --out m.gguf --arch qwen3 --wtype Q4_0       # random-weight GGUF (or --preset qwen3-0.6b)
+rust_trainer synth    --out m.gguf --arch qwen3 --wtype Q4_0       # random-weight GGUF (or --preset qwen3-0.6b;
+                                                                   #  shape overrides --layers --hidden --heads --kv-heads --head-dim --ff --vocab)
 rust_trainer toy                                                   # Qwen3.5-shaped demo, no files needed
 ```
 
@@ -118,6 +119,9 @@ These were measured in this build sandbox: 4 x86 vCPUs, AVX2, engine threads = 4
 |---|---|---|
 | Qwen2.5-0.5B | 93 tok/s | 21 tok/s |
 | Qwen3-0.6B | 70 tok/s | 17 tok/s |
+| Qwen3-8B (4.4 GB file, r = 8: 21.8 M LoRA params) | 6.9 tok/s | 1.4 tok/s |
+
+For comparison, the engine itself (`rie bench`, same files and threads) does prompt processing / generation at 144 / 32 tok/s for Qwen2.5-0.5B and 8.1 / 2.3 tok/s for Qwen3-8B.
 
 A training step costs about 4.4× a forward pass. Most of the backward time is `dx = dy·W` from dequantised rows. The engine has no transposed int8 kernel, and keeping transposed copies would double weight memory on the phone.
 

@@ -1,6 +1,6 @@
 //! Training throughput on real model shapes (random weights) through the engine.
 //!
-//! `cargo run --release --example bench_train -- PRESET [WTYPE] [SEQ] [STEPS] [THREADS]`
+//! `cargo run --release --example bench_train -- PRESET|FILE.gguf [WTYPE] [SEQ] [STEPS] [THREADS]`
 //! e.g. `bench_train qwen2.5-0.5b Q4_0 128 3 4`. Prints seconds per step and
 //! trained tokens per second (forward + recomputation + backward).
 
@@ -23,9 +23,13 @@ fn main() {
     let steps: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
     let threads: Option<usize> = a.get(4).and_then(|s| s.parse().ok());
     let rank: usize = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(8);
-    let spec = SyntheticSpec::preset(preset, wtype).expect("unknown preset");
     let t0 = Instant::now();
-    let file = Arc::new(GgufFile::from_bytes(spec.build()).unwrap());
+    // A preset name builds the model in memory; a .gguf path is memory-mapped.
+    let file = if preset.ends_with(".gguf") {
+        Arc::new(GgufFile::open(preset).unwrap())
+    } else {
+        Arc::new(GgufFile::from_bytes(SyntheticSpec::preset(preset, wtype).expect("unknown preset").build()).unwrap())
+    };
     let mut model = load_gguf_from(file, &GgufOptions { n_threads: threads, pin_threads: false }).unwrap().model;
     let n = model.attach_lora(rank, 2.0 * rank as f32, DEFAULT_TARGETS, 1);
     eprintln!(
