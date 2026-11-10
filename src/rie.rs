@@ -205,6 +205,12 @@ pub fn load_gguf_from(file: Arc<GgufFile>, opts: &GgufOptions) -> io::Result<Ggu
             return Err(io_err("post-norm layers are not supported"));
         }
         let p = |s: &str| format!("blk.{i}.{s}");
+        let dense = match &l.ffn {
+            rie_core::model::Ffn::Dense(d) => d,
+            rie_core::model::Ffn::Moe(_) => {
+                return Err(io_err(format!("layer {i}: mixture-of-experts feed-forward blocks are not trainable yet (dense models only)")))
+            }
+        };
         blocks.push(Block {
             input_norm: l.attn_norm.clone(),
             mixer: Mixer::Attn(Attention {
@@ -220,9 +226,9 @@ pub fn load_gguf_from(file: Arc<GgufFile>, opts: &GgufOptions) -> io::Result<Ggu
             }),
             post_norm: l.ffn_norm.clone(),
             mlp: Mlp {
-                gate_proj: Linear::new(p("ffn_gate"), fz(&l.w_gate), None),
-                up_proj: Linear::new(p("ffn_up"), fz(&l.w_up), None),
-                down_proj: Linear::new(p("ffn_down"), fz(&l.w_down), None),
+                gate_proj: Linear::new(p("ffn_gate"), fz(&dense.gate), None),
+                up_proj: Linear::new(p("ffn_up"), fz(&dense.up), None),
+                down_proj: Linear::new(p("ffn_down"), fz(&dense.down), None),
             },
         });
     }
