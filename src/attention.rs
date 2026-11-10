@@ -204,19 +204,25 @@ impl Attention {
                     let row = &mut probs[i * t..(i + 1) * t];
                     let mut m = f32::NEG_INFINITY;
                     for j in 0..=i {
-                        row[j] = kv.score(j, g, &qs);
-                        m = m.max(row[j]);
+                        if rope.allowed(i, j) {
+                            row[j] = kv.score(j, g, &qs);
+                            m = m.max(row[j]);
+                        }
                     }
                     let mut s = 0.0;
                     for j in 0..=i {
-                        row[j] = (row[j] - m).exp();
-                        s += row[j];
+                        if rope.allowed(i, j) {
+                            row[j] = (row[j] - m).exp();
+                            s += row[j];
+                        }
                     }
                     let inv = 1.0 / s;
                     let oi = &mut out[i * hd..(i + 1) * hd];
                     for j in 0..=i {
-                        row[j] *= inv;
-                        kv.accumulate(j, g, row[j], oi);
+                        if rope.allowed(i, j) {
+                            row[j] *= inv;
+                            kv.accumulate(j, g, row[j], oi);
+                        }
                     }
                 }
                 (probs, out)
@@ -272,6 +278,9 @@ impl Attention {
                     let doi = &d_o[(i * nh + h) * hd..(i * nh + h + 1) * hd];
                     let mut sum = 0.0;
                     for j in 0..=i {
+                        if !rope.allowed(i, j) {
+                            continue;
+                        }
                         let vj = &v[(j * nkv + g) * hd..(j * nkv + g + 1) * hd];
                         dp[j] = dot(doi, vj);
                         sum += p[i * t + j] * dp[j];
@@ -283,6 +292,9 @@ impl Attention {
                     }
                     let qi = &q[(i * nh + h) * hd..(i * nh + h + 1) * hd];
                     for j in 0..=i {
+                        if !rope.allowed(i, j) {
+                            continue;
+                        }
                         let ds = p[i * t + j] * (dp[j] - sum) * scale;
                         if ds == 0.0 {
                             continue;

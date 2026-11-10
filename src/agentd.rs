@@ -31,7 +31,6 @@
 //! [`crate::eval::greedy_prefix`]) without the grammar, so a score here never
 //! exceeds what grammar-constrained decoding would get.
 
-use crate::eval::greedy_prefix;
 use crate::linear::Lora;
 use crate::model::{answer_targets, Model};
 use crate::optim::{param_names, AdamW, AdamWConfig};
@@ -279,8 +278,13 @@ pub fn judge(model: &Model, held: &[(Example, usize)]) -> f32 {
         return 0.0;
     }
     let mut total = 0.0;
-    for (ex, tool_len) in held {
-        let (ok, n) = greedy_prefix(model, ex);
+    // Requests share agentd's long system prompt: judge them 4 at a time, the prompt once.
+    let mut results = Vec::with_capacity(held.len());
+    for chunk in held.chunks(4) {
+        let exs: Vec<&Example> = chunk.iter().map(|(e, _)| e).collect();
+        results.extend(crate::eval::greedy_prefix_batch(model, &exs));
+    }
+    for ((_, tool_len), (ok, n)) in held.iter().zip(results) {
         total += if ok == n {
             1.0
         } else if *tool_len > 0 && ok >= *tool_len {
@@ -444,12 +448,30 @@ pub fn run(model: &mut Model, enc: &Encoders, job: &AgentdJob, log: &mut dyn FnM
         }
         model.zero_grad();
         let mut total = 0.0;
-        for k in 0..b {
-            let ex = &examples[(step * b + k) % examples.len()];
-            let targets = answer_targets(&ex.tokens, ex.answer_start);
-            let w = vec![1.0 / (targets.len().max(1) * b) as f32; targets.len()];
-            let lp = model.forward_backward(&ex.tokens, &targets, &w);
-            total += -lp.iter().sum::<f32>() / targets.len().max(1) as f32;
+        let batch: Vec<&Example> = (0..b).map(|k| &examples[(step * b + k) % examples.len()]).collect();
+        let seqs: Vec<&[u32]> = batch.iter().map(|e| e.tokens.as_slice()).collect();
+        if let Some(p) = crate::eval::worth_packing(model, &seqs) {
+            // One pass for the whole batch: agentd's system prompt is computed once.
+            let (mut targets, mut w, mut lens) = (Vec::new(), Vec::new(), Vec::new());
+            for (k, ex) in batch.iter().enumerate() {
+                let t = answer_targets(&ex.tokens, ex.answer_start);
+                w.extend(std::iter::repeat_n(1.0 / (t.len().max(1) * b) as f32, t.len()));
+                lens.push(t.len());
+                targets.extend(p.map_targets(k, &t));
+            }
+            let lp = model.forward_backward_packed(&p, &targets, &w, &mut || false).expect("never stopped");
+            let mut at = 0;
+            for n in lens {
+                total += -lp[at..at + n].iter().sum::<f32>() / n.max(1) as f32;
+                at += n;
+            }
+        } else {
+            for ex in &batch {
+                let targets = answer_targets(&ex.tokens, ex.answer_start);
+                let w = vec![1.0 / (targets.len().max(1) * b) as f32; targets.len()];
+                let lp = model.forward_backward(&ex.tokens, &targets, &w);
+                total += -lp.iter().sum::<f32>() / targets.len().max(1) as f32;
+            }
         }
         opt.step(model, job.lr);
         last_loss = total / b as f32;

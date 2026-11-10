@@ -90,11 +90,18 @@ pub fn l2norm_backward(y: &[f32], norms: &[f32], dy: &[f32], d: usize) -> Vec<f3
 /// each head. NEOX style rotates `(x[i], x[i+rot/2])` (Qwen); normal / GPT-J
 /// style rotates `(x[2i], x[2i+1])` (Llama GGUF layout). Frequencies are
 /// computed exactly like the inference engine (`rie_core::ops::Rope`), in f32.
+///
+/// It also carries the *token layout* attention must respect: each token's
+/// position, and for packed batches a segment per token. Segment 0 is a prompt
+/// shared by the whole batch; a token in segment `k > 0` may attend to the shared
+/// prompt and to earlier tokens of its own segment only. That lets several examples
+/// that start with the same prompt be computed in one pass, the prompt once.
 pub struct Rope {
     pub rot_dim: usize,
     pub neox: bool,
     pub cos: Vec<f32>, // [t × rot_dim/2]
     pub sin: Vec<f32>,
+    pub segments: Option<Vec<u32>>,
 }
 
 impl Rope {
@@ -103,7 +110,25 @@ impl Rope {
     }
 
     pub fn with(t: usize, rot_dim: usize, neox: bool, base: f32, freq_scale: f32, factors: Option<&[f32]>) -> Self {
+        let positions: Vec<usize> = (0..t).collect();
+        Self::at_positions(&positions, None, rot_dim, neox, base, freq_scale, factors)
+    }
+
+    /// Tables for tokens at arbitrary `positions`, with an optional segment layout (see above).
+    pub fn at_positions(
+        positions: &[usize],
+        segments: Option<Vec<u32>>,
+        rot_dim: usize,
+        neox: bool,
+        base: f32,
+        freq_scale: f32,
+        factors: Option<&[f32]>,
+    ) -> Self {
         assert!(rot_dim % 2 == 0);
+        if let Some(s) = &segments {
+            assert_eq!(s.len(), positions.len());
+        }
+        let t = positions.len();
         let half = rot_dim / 2;
         let inv_freq: Vec<f32> = (0..half)
             .map(|i| {
@@ -118,14 +143,24 @@ impl Rope {
             .collect();
         let mut cos = vec![0.0; t * half];
         let mut sin = vec![0.0; t * half];
-        for p in 0..t {
+        for (p, &pos) in positions.iter().enumerate() {
             for (i, f) in inv_freq.iter().enumerate() {
-                let (s, c) = (p as f32 * f).sin_cos();
+                let (s, c) = (pos as f32 * f).sin_cos();
                 cos[p * half + i] = c;
                 sin[p * half + i] = s;
             }
         }
-        Rope { rot_dim, neox, cos, sin }
+        Rope { rot_dim, neox, cos, sin, segments }
+    }
+
+    /// May token `i` attend to token `j`? Causal, and within the segment layout.
+    #[inline]
+    pub fn allowed(&self, i: usize, j: usize) -> bool {
+        j <= i
+            && match &self.segments {
+                None => true,
+                Some(s) => s[j] == 0 || s[j] == s[i],
+            }
     }
 
     /// In-place rotation of `x` laid out `[t × heads × head_dim]`.

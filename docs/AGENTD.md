@@ -57,6 +57,25 @@ The 30-step adapter answers 8 of 12 held-out requests exactly and picks the righ
 
 `tests/agentd.rs` checks the protocol on a synthetic GGUF: a time-boxed launch, then a resumed launch that is **bit-identical** to an uninterrupted job. It also checks that the base score is carried over, the checkpoint is removed at the end, and the AGLORA1 round-trip reproduces the trained model exactly.
 
+## Speed: shared prompt computed once per batch
+
+Every agentd example starts with the same long system prompt (about 720 tokens here), and only the request and answer differ (about 30 tokens). Within one optimiser step the adapter is fixed, so `rust_trainer` packs a batch into one sequence, `[system prompt | request₁ answer₁ | request₂ answer₂ | …]`:
+
+* each request attends to the prompt and to itself only;
+* each request keeps its own positions for RoPE;
+* gradients from every request flow into the single shared prompt.
+
+Judging packs the held-out requests 4 at a time the same way. This is the same idea as agenticOS's Phase 6 ("train a batch in one pass with its shared prompt computed once"). It is exact: packed log-probs equal separate ones bit for bit on an engine-backed Q4_0 model, and LoRA gradients agree to 1e-5 (`packed_batch_on_engine_model`, `packed_batch_equals_separate_examples`).
+
+Measured on agentd's export with real Qwen3-0.6B Q4_0 (4 x86 vCPUs, agentd's default batch 4, 3 steps, judging 12 held out before and after):
+
+| | wall time | held-out score after |
+|---|---|---|
+| one pass per example (`RT_NO_PACK=1`) | 673 s | 58 % |
+| packed batches | **205 s (3.3×)** | 58 % |
+
+Packing is used whenever the shared prompt is at least half of an average example, and only on attention-only models: a DeltaNet state cannot branch.
+
 ## Switching agentd to rust_trainer
 
 agentd starts the trainer with `cfg.llama_server`, the same binary that serves the model (`crates/agentd/src/core.rs`, `self.trainer.start(&bin, …)`). To use this trainer, give it its own config key in agentd, for example:

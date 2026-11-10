@@ -231,6 +231,64 @@ pub fn answer_targets(tokens: &[u32], answer_start: usize) -> Vec<Target> {
     (answer_start.max(1)..tokens.len()).map(|i| Target { pos: i - 1, token: tokens[i] }).collect()
 }
 
+/// Several examples that start with the same prompt, laid out as one sequence:
+/// `[shared prompt | rest of example 1 | rest of example 2 | …]`. Each example's
+/// tokens keep their original positions (for RoPE) and attend to the shared
+/// prompt and to their own earlier tokens only (segment `k+1` for example `k`,
+/// segment 0 for the prompt). The result equals running the examples separately,
+/// while the prompt is computed, forward and backward, once per batch.
+#[derive(Clone, Debug)]
+pub struct Packed {
+    pub tokens: Vec<u32>,
+    pub positions: Vec<usize>,
+    pub segments: Vec<u32>,
+    /// Length of the shared prompt.
+    pub shared: usize,
+    /// Where each example's own tokens start in `tokens`.
+    pub offsets: Vec<usize>,
+}
+
+impl Packed {
+    /// Index in `tokens` of position `pos` of example `k`.
+    pub fn index(&self, k: usize, pos: usize) -> usize {
+        if pos < self.shared {
+            pos
+        } else {
+            self.offsets[k] + pos - self.shared
+        }
+    }
+    /// Example `k`'s targets (as for its own sequence) mapped into the packed sequence.
+    pub fn map_targets(&self, k: usize, targets: &[Target]) -> Vec<Target> {
+        targets.iter().map(|t| Target { pos: self.index(k, t.pos), token: t.token }).collect()
+    }
+}
+
+/// Pack sequences that share a leading prompt. The shared part is their longest
+/// common prefix, kept short enough that every sequence has at least one token of
+/// its own.
+pub fn pack(seqs: &[&[u32]]) -> Packed {
+    assert!(!seqs.is_empty());
+    let min_len = seqs.iter().map(|s| s.len()).min().unwrap();
+    let mut shared = 0;
+    while shared + 1 < min_len && seqs.iter().all(|s| s[shared] == seqs[0][shared]) {
+        shared += 1;
+    }
+    if seqs.len() == 1 {
+        shared = 0;
+    }
+    let mut tokens = seqs[0][..shared].to_vec();
+    let mut positions: Vec<usize> = (0..shared).collect();
+    let mut segments = vec![0u32; shared];
+    let mut offsets = Vec::with_capacity(seqs.len());
+    for (k, s) in seqs.iter().enumerate() {
+        offsets.push(tokens.len());
+        tokens.extend_from_slice(&s[shared..]);
+        positions.extend(shared..s.len());
+        segments.extend(std::iter::repeat_n(k as u32 + 1, s.len() - shared));
+    }
+    Packed { tokens, positions, segments, shared, offsets }
+}
+
 pub struct Model {
     pub cfg: ModelConfig,
     pub embed: Frozen,
@@ -400,10 +458,42 @@ impl Model {
         Rope::with(t, a.rot_dim, a.rope_neox, a.rope_theta, a.rope_freq_scale, self.rope_factors.as_deref())
     }
 
+    fn rope_for(&self, layout: Option<&Packed>, t: usize) -> Rope {
+        match layout {
+            None => self.rope(t),
+            Some(p) => {
+                assert!(
+                    self.blocks.iter().all(|b| matches!(b.mixer, Mixer::Attn(_))),
+                    "packed batches need attention-only models (DeltaNet state cannot branch)"
+                );
+                let a = &self.cfg.attn;
+                Rope::at_positions(
+                    &p.positions,
+                    Some(p.segments.clone()),
+                    a.rot_dim,
+                    a.rope_neox,
+                    a.rope_theta,
+                    a.rope_freq_scale,
+                    self.rope_factors.as_deref(),
+                )
+            }
+        }
+    }
+
+    /// Whether this model can compute packed batches (attention only).
+    pub fn supports_packing(&self) -> bool {
+        self.blocks.iter().all(|b| matches!(b.mixer, Mixer::Attn(_)))
+    }
+
     /// Final hidden states (after the last block, before the final norm).
     pub fn forward_hidden(&self, tokens: &[u32]) -> Vec<f32> {
+        self.forward_hidden_with(tokens, None)
+    }
+
+    /// [`Model::forward_hidden`] for a plain sequence or a packed batch (`p.tokens`).
+    pub fn forward_hidden_with(&self, tokens: &[u32], layout: Option<&Packed>) -> Vec<f32> {
         let t = tokens.len();
-        let rope = self.rope(t);
+        let rope = self.rope_for(layout, t);
         let mut x = self.embed_tokens(tokens);
         for b in &self.blocks {
             x = b.forward(&x, t, &rope, self.cfg.rms_eps, self.cfg.norm_offset).0;
@@ -422,8 +512,13 @@ impl Model {
 
     /// Full logits (`[positions.len() × vocab]`) at the given positions.
     pub fn logits_at(&self, tokens: &[u32], positions: &[usize]) -> Vec<f32> {
+        self.logits_at_with(tokens, None, positions)
+    }
+
+    /// [`Model::logits_at`] for a plain sequence or a packed batch.
+    pub fn logits_at_with(&self, tokens: &[u32], layout: Option<&Packed>, positions: &[usize]) -> Vec<f32> {
         let d = self.hidden();
-        let x = self.forward_hidden(tokens);
+        let x = self.forward_hidden_with(tokens, layout);
         let mut xs = vec![0.0; positions.len() * d];
         for (i, &p) in positions.iter().enumerate() {
             xs[i * d..(i + 1) * d].copy_from_slice(&x[p * d..(p + 1) * d]);
@@ -531,9 +626,32 @@ impl Model {
         weights: &[f32],
         stop: &mut dyn FnMut() -> bool,
     ) -> Option<Vec<f32>> {
+        self.forward_backward_layout(tokens, None, targets, weights, stop)
+    }
+
+    /// Forward + backward over a packed batch: several examples sharing a prompt, the
+    /// prompt computed once (see [`pack`]). `targets` index into `p.tokens`.
+    pub fn forward_backward_packed(
+        &mut self,
+        p: &Packed,
+        targets: &[Target],
+        weights: &[f32],
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<f32>> {
+        self.forward_backward_layout(&p.tokens, Some(p), targets, weights, stop)
+    }
+
+    fn forward_backward_layout(
+        &mut self,
+        tokens: &[u32],
+        layout: Option<&Packed>,
+        targets: &[Target],
+        weights: &[f32],
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<f32>> {
         assert_eq!(targets.len(), weights.len());
         let t = tokens.len();
-        let rope = self.rope(t);
+        let rope = self.rope_for(layout, t);
         let (eps, off) = (self.cfg.rms_eps, self.cfg.norm_offset);
         let mut x = self.embed_tokens(tokens);
         let mut inputs: Vec<Vec<f32>> = Vec::new();

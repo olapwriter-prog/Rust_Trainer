@@ -246,6 +246,25 @@ impl<'m> Trainer<'m> {
     }
 
     /// Accumulate the gradient of one example; returns its loss contribution.
+    /// Supervised batches whose examples share a long prompt are computed in one
+    /// packed pass (the prompt once). `None`: not applicable, use per-example passes;
+    /// `Some(None)`: stopped by `ctl`; `Some(Some(loss))`: done.
+    fn packed_batch_grad(&mut self, batch: &[usize], batch_tokens: usize, ctl: &mut dyn Control) -> Option<Option<f32>> {
+        let TrainData::Sft(v) = &self.data else { return None };
+        let seqs: Vec<&[u32]> = batch.iter().map(|&i| v[i].tokens.as_slice()).collect();
+        let p = crate::eval::worth_packing(self.model, &seqs)?;
+        if !ctl.should_continue() {
+            return Some(None);
+        }
+        let mut targets = Vec::new();
+        for (k, &i) in batch.iter().enumerate() {
+            targets.extend(p.map_targets(k, &answer_targets(&v[i].tokens, v[i].answer_start)));
+        }
+        let w = vec![1.0 / batch_tokens as f32; targets.len()];
+        let mut stop = || !ctl.should_continue_within();
+        Some(self.model.forward_backward_packed(&p, &targets, &w, &mut stop).map(|lp| -lp.iter().sum::<f32>() / batch_tokens as f32))
+    }
+
     /// Accumulate one example's gradient; `None` if `ctl` stopped it mid-way.
     fn example_grad(&mut self, idx: usize, batch_tokens: usize, batch_n: usize, ctl: &mut dyn Control) -> Option<f32> {
         let mut stop = || !ctl.should_continue_within();
@@ -313,16 +332,22 @@ impl<'m> Trainer<'m> {
             self.model.zero_grad();
             let mut loss = 0.0;
             let mut paused = false;
-            for &i in &batch {
-                if !ctl.should_continue() {
-                    paused = true;
-                    break;
-                }
-                match self.example_grad(i, batch_tokens, batch.len(), ctl) {
-                    Some(l) => loss += l,
-                    None => {
-                        paused = true;
-                        break;
+            match self.packed_batch_grad(&batch, batch_tokens, ctl) {
+                Some(Some(l)) => loss = l,
+                Some(None) => paused = true,
+                None => {
+                    for &i in &batch {
+                        if !ctl.should_continue() {
+                            paused = true;
+                            break;
+                        }
+                        match self.example_grad(i, batch_tokens, batch.len(), ctl) {
+                            Some(l) => loss += l,
+                            None => {
+                                paused = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }

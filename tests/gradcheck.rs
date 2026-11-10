@@ -273,3 +273,66 @@ fn weights_are_linear() {
         assert!((a * -0.5 - b).abs() < 1e-5 * a.abs().max(1.0));
     }
 }
+
+/// A packed batch (shared prompt computed once) gives the same log-probs and LoRA
+/// gradients as running each example separately.
+#[test]
+fn packed_batch_equals_separate_examples() {
+    use rust_trainer::model::pack;
+    let mut model = Model::random(ModelConfig::tiny_dense(50), 41, false);
+    model.attach_lora(3, 6.0, rust_trainer::model::DEFAULT_TARGETS, 42);
+    randomize_lora_b(&mut model, 43);
+    let mut rng = Rng::new(44);
+    let prompt: Vec<u32> = (0..13).map(|_| rng.below(50) as u32).collect();
+    // three examples sharing the prompt, different lengths; one answer starts inside the shared part
+    let mut seqs: Vec<(Vec<u32>, usize)> = Vec::new();
+    for (extra, start) in [(5usize, 15usize), (9, 14), (3, 12)] {
+        let mut s = prompt.clone();
+        s.extend((0..extra).map(|_| rng.below(50) as u32));
+        seqs.push((s, start));
+    }
+    let grads_of = |m: &Model| -> Vec<f32> {
+        m.lora_linears()
+            .iter()
+            .flat_map(|l| {
+                let lo = l.lora.as_ref().unwrap();
+                lo.ga.iter().chain(&lo.gb).copied().collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
+    // separate
+    model.zero_grad();
+    let mut sep_lp = Vec::new();
+    for (s, start) in &seqs {
+        let t = answer_targets(s, *start);
+        let w = vec![0.1; t.len()];
+        sep_lp.extend(model.forward_backward(s, &t, &w));
+    }
+    let g_sep = grads_of(&model);
+
+    // packed
+    let refs: Vec<&[u32]> = seqs.iter().map(|(s, _)| s.as_slice()).collect();
+    let p = pack(&refs);
+    assert_eq!(p.shared, 13, "the whole common prompt is shared");
+    let mut targets = Vec::new();
+    for (k, (s, start)) in seqs.iter().enumerate() {
+        targets.extend(p.map_targets(k, &answer_targets(s, *start)));
+    }
+    let w = vec![0.1; targets.len()];
+    model.zero_grad();
+    let packed_lp = model.forward_backward_packed(&p, &targets, &w, &mut || false).unwrap();
+    let g_pack = grads_of(&model);
+
+    for (a, b) in sep_lp.iter().zip(&packed_lp) {
+        assert!((a - b).abs() < 1e-5, "logprob {a} vs {b}");
+    }
+    let scale = g_sep.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    for (a, b) in g_sep.iter().zip(&g_pack) {
+        assert!((a - b).abs() <= 1e-5 * scale.max(1.0), "grad {a} vs {b}");
+    }
+    // a batch of one is just the sequence
+    let one = pack(&refs[..1]);
+    assert_eq!(one.shared, 0);
+    assert_eq!(one.tokens, seqs[0].0);
+}

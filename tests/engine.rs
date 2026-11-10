@@ -292,3 +292,36 @@ fn real_model_logits_match_engine() {
     eprintln!("{path}: {} tokens × vocab {nv} logits, max |Δ| = {worst:e}", tokens.len());
     assert_eq!(worst, 0.0);
 }
+
+/// Packed batches on an engine-backed quantised model: same log-probs as separate examples.
+#[test]
+fn packed_batch_on_engine_model() {
+    use rust_trainer::model::pack;
+    let file = synth("qwen3", GgmlType::Q4_0, true);
+    let gm = load_gguf_from(file, &opts()).unwrap();
+    let mut rng = Rng::new(8);
+    let prompt: Vec<u32> = (0..40).map(|_| 3 + rng.below(300) as u32).collect();
+    let seqs: Vec<Vec<u32>> = (0..4)
+        .map(|k| {
+            let mut s = prompt.clone();
+            s.extend((0..6 + k).map(|_| 3 + rng.below(300) as u32));
+            s
+        })
+        .collect();
+    let refs: Vec<&[u32]> = seqs.iter().map(|s| s.as_slice()).collect();
+    let p = pack(&refs);
+    let mut worst = 0.0f32;
+    for (k, s) in seqs.iter().enumerate() {
+        let t = answer_targets(s, 38);
+        let sep = gm.model.logprobs(s, &t);
+        let positions: Vec<usize> = t.iter().map(|x| p.index(k, x.pos)).collect();
+        let logits = gm.model.logits_at_with(&p.tokens, Some(&p), &positions);
+        let nv = gm.model.cfg.vocab_size;
+        for (i, tg) in t.iter().enumerate() {
+            let lp = log_softmax(&logits[i * nv..(i + 1) * nv])[tg.token as usize];
+            worst = worst.max((lp - sep[i]).abs());
+        }
+    }
+    eprintln!("packed vs separate on Q4_0: max |Δ log p| = {worst:e}");
+    assert!(worst < 1e-4, "{worst}");
+}

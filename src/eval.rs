@@ -172,3 +172,50 @@ pub fn greedy_prefix(model: &Model, ex: &Example) -> (usize, usize) {
     }
     (ok, positions.len())
 }
+
+/// Pack a batch only when the shared prompt is at least half of an average example;
+/// otherwise the longer packed sequence would cost more attention than it saves.
+/// `RT_NO_PACK=1` turns packing off (for A/B timing).
+pub fn worth_packing(model: &Model, seqs: &[&[u32]]) -> Option<crate::model::Packed> {
+    if seqs.len() < 2 || !model.supports_packing() || std::env::var_os("RT_NO_PACK").is_some() {
+        return None;
+    }
+    let p = crate::model::pack(seqs);
+    let avg = seqs.iter().map(|s| s.len()).sum::<usize>() / seqs.len();
+    (p.shared * 2 >= avg).then_some(p)
+}
+
+/// [`greedy_prefix`] for several examples, sharing their common prompt when worthwhile.
+pub fn greedy_prefix_batch(model: &Model, exs: &[&Example]) -> Vec<(usize, usize)> {
+    let seqs: Vec<&[u32]> = exs.iter().map(|e| e.tokens.as_slice()).collect();
+    let Some(p) = worth_packing(model, &seqs) else {
+        return exs.iter().map(|e| greedy_prefix(model, e)).collect();
+    };
+    let v = model.cfg.vocab_size;
+    let mut all_pos = Vec::new();
+    let mut spans = Vec::new();
+    for (k, e) in exs.iter().enumerate() {
+        let start = e.answer_start.max(1);
+        let from = all_pos.len();
+        for pos in start - 1..e.tokens.len().saturating_sub(1) {
+            all_pos.push(p.index(k, pos));
+        }
+        spans.push((from, all_pos.len(), start));
+    }
+    let logits = model.logits_at_with(&p.tokens, Some(&p), &all_pos);
+    exs.iter()
+        .zip(&spans)
+        .map(|(e, &(from, to, start))| {
+            let mut ok = 0;
+            for i in from..to {
+                let row = &logits[i * v..(i + 1) * v];
+                let arg = (0..v).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32;
+                if arg != e.tokens[start + (i - from)] {
+                    break;
+                }
+                ok += 1;
+            }
+            (ok, to - from)
+        })
+        .collect()
+}
