@@ -64,13 +64,12 @@ fn logits_match_engine() {
                 let (ref_logits, nv) = engine_logits(&file, &tokens);
                 let gm = load_gguf_from(file.clone(), &opts()).unwrap();
                 assert_eq!(gm.model.cfg.tie_embeddings, tied);
-                let mut diffs = Vec::new();
-                for pos in [0usize, 11, 23] {
-                    let reference = log_softmax(&ref_logits[pos * nv..(pos + 1) * nv]);
-                    let targets: Vec<Target> = (0..nv as u32).map(|tok| Target { pos, token: tok }).collect();
-                    let ours = gm.model.logprobs(&tokens, &targets);
-                    diffs.extend(ours.iter().zip(&reference).map(|(a, b)| (a - b).abs()));
-                }
+                // Every logit at every position, compared raw: the trainer's own
+                // log-softmax (f64 normaliser) is deliberately more precise than the
+                // engine's sampler needs, so parity is a statement about logits.
+                let positions: Vec<usize> = (0..tokens.len()).collect();
+                let ours = gm.model.logits_at(&tokens, &positions);
+                let diffs: Vec<f32> = ours.iter().zip(&ref_logits).map(|(a, b)| (a - b).abs()).collect();
                 let worst = diffs.iter().cloned().fold(0.0f32, f32::max);
                 let close = diffs.iter().filter(|d| **d < 1e-3).count() as f32 / diffs.len() as f32;
                 let argmax_targets: Vec<Target> = (0..tokens.len())
@@ -82,7 +81,7 @@ fn logits_match_engine() {
                     .collect();
                 let (_, hits) = gm.model.score(&tokens, &argmax_targets);
                 eprintln!(
-                    "{arch:>6} {wt:?} tied={tied}: max |Δ log p| {worst:.1e}, {:.1}% < 1e-3, greedy {hits}/{}",
+                    "{arch:>6} {wt:?} tied={tied}: max |Δ logit| {worst:.1e} over all positions, {:.1}% < 1e-3, greedy {hits}/{}",
                     close * 100.0,
                     tokens.len()
                 );

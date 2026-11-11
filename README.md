@@ -28,7 +28,7 @@ agentd ctl learn ──► confirmed.jsonl ──► rust_trainer run ───�
 | **agentd drop-in** (`rust_trainer train -m … --data learn/sft.jsonl --grammar … --out adapter.new.lora --steps N --max-seconds S`): agentd's real job protocol, AGLORA1 adapters served unchanged by `agentos-llm --lora` | ✅ verified with agentd's real export on Qwen3-0.6B: agentos-llm's held-out score 4.2 % → 75 % with our adapter (30 steps); batches share agentd's system prompt in one pass (3.3× faster, exact); agentd needs one config key to launch it ([`docs/AGENTD.md`](docs/AGENTD.md)) |
 | Engine side (load and apply `adapter.gguf`) | ⏳ in the engine's own session; spec and acceptance test in [`docs/ENGINE_LORA.md`](docs/ENGINE_LORA.md) |
 | Measured improvement on held-out requests with a real model (plan step 3) | ✅ in the sandbox: real Qwen3-0.6B Q4_0, one simulated night, 140 open-dataset requests → exact action 0 % → 42.9 %, intent 0 % → 97.6 % on 42 unseen requests. ⏳ on your own corrections |
-| Parity of the HF/Qwen3.5 path with `transformers` + `peft` | ⏳ harness in `tools/parity.py`, not yet run (no PyTorch here) |
+| Gradients on real models vs an independent float64 reference (NumPy, no shared code) | ✅ Qwen3-0.6B, Qwen2.5-0.5B, SmolLM2-360M in CI ([risks and limits](#engineering-risks-and-limits)); the `transformers` harness `tools/parity.py` for the Qwen3.5 path is still unrun |
 
 ## Build
 
@@ -188,6 +188,34 @@ At these rates, 200 examples × 100 tokens × 2 epochs (40 k trained tokens) tak
 * **`tests/gradcheck.rs`:** every op and mixer (including DeltaNet with BPTT chunk sizes 1, 3, 4, 7 and 20) against finite differences, and end-to-end LoRA gradients in f32 and Q8_0.
 * **`tests/training.rs`:** loss falls and the gate accepts; pause/resume is exact; DPO; PEFT adapter round-trip with apply/merge; the overnight flow with exact ledger sequence; power hysteresis.
 * **Unit tests:** data filter, chat formatting, safetensors, registry, LR schedule, Q8_0.
+
+## Engineering risks and limits
+
+These are the trade-offs of this design and how each is handled. Points from an external review that describe a different codebase (Mamba/HPN layers, bincode checkpoints) do not apply here; the rest are below.
+
+**1. Hand-written backward passes instead of autograd.** Every layer's gradient is derived by hand. That is what lets training run on the engine's compressed weights with the engine's own arithmetic. The cost is that a wrong derivative can make training quietly worse rather than crash. Three independent checks guard against that:
+
+* **Every op and layer type** against finite differences on small models (`tests/gradcheck.rs`). This covers attention variants, DeltaNet with BPTT, packed batches, and recomputation versus kept activations.
+* **Real models against an independent float64 reference.** `tools/reference_check.py` re-implements the decoder in NumPy, sharing no code with the trainer, and compares the loss and the gradients (random directions over every adapter weight, plus individual entries in the first, middle and last layers) on real Qwen3-0.6B, Qwen2.5-0.5B and SmolLM2-360M. It runs in CI.
+
+  | | loss vs float64 | gradient direction error / ‖g‖ | worst single entry |
+  |---|---|---|---|
+  | Qwen3-0.6B | 3.7 × 10⁻⁸ | ≤ 1.6 × 10⁻⁸ … 4.6 × 10⁻⁷ | 8.0 × 10⁻⁵ |
+  | Qwen2.5-0.5B (q/k/v biases) | 3.5 × 10⁻⁷ | ≤ 9 × 10⁻⁷ | 1.9 × 10⁻³ |
+  | SmolLM2-360M (Llama, normal RoPE) | 7.4 × 10⁻⁸ | ≤ 3.6 × 10⁻⁷ | 9.4 × 10⁻⁴ |
+
+  It has teeth: a planted wrong SiLU derivative left the loss unchanged but failed the gradient checks by 54×. It also found a real precision bug. The softmax normaliser, summed over the whole vocabulary in float32, was off by ~10⁻⁴ and shifted every loss and gradient; it is now summed in float64.
+* **Forward bit-exact with the engine** on 36 synthetic configurations (every logit at every position), on all three real models, and on three ARM CPU tiers under QEMU.
+
+**2. Coupling to the engine.** The trainer reproduces the engine's arithmetic exactly, so engine changes can break it. That happened once, when the engine reorganised its layers for MoE. A daily CI job (`engine-head`) builds and tests against the engine's newest commit, so drift is caught within a day rather than at the next manual update.
+
+**3. New layer types need new code.** SwiGLU, RMSNorm (both conventions), GQA attention with RoPE, QK-norm and output gating, and Gated DeltaNet are implemented. A new layer type means writing and gradient-checking its forward and backward passes. MoE feed-forward blocks are not implemented (MoE models are refused), and Qwen3.5 trains only from Hugging Face files until the engine supports it.
+
+**4. CPU only.** Measured here: 21 tok/s training for 0.5B and 1.4 tok/s for 8B on 4 x86 vCPUs. Shared-prompt batching makes agentd jobs 3.3× faster, but nightly training is practical up to about 4B on a phone. The trainer does not use the engine's GPU backend.
+
+**5. One device, by design.** The goal is overnight LoRA training on the phone itself. There is no multi-GPU or multi-node training, and none is planned.
+
+**Formats are open.** Adapters are written as PEFT safetensors (Hugging Face), llama.cpp-style LoRA GGUF, and agentd's AGLORA1; training checkpoints are safetensors.
 
 ## Integration still to do (other repositories)
 

@@ -44,3 +44,7 @@ hf-tokenizers = ["dep:tokenizers"]
 [[example]]
 name = "bench_train"
 required-features = ["rie"]
+
+[[example]]
+name = "export_reference"
+required-features = ["rie"]

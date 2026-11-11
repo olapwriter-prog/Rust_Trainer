@@ -230,12 +230,18 @@ pub fn silu_backward(x: &[f32], dy: &[f32]) -> Vec<f32> {
 }
 
 /// Numerically stable log-softmax of one row, returning `(logsumexp, probs)`.
+///
+/// The normaliser is a sum over the whole vocabulary (152k terms for Qwen). A
+/// sequential f32 sum of that many positive terms drifts by ~1e-4 relative, which
+/// shifted every log-prob and scaled every softmax gradient; it is accumulated in
+/// f64 instead (found by `tools/reference_check.py` against a float64 reference).
 pub fn softmax_row(logits: &[f32]) -> (f32, Vec<f32>) {
     let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut p: Vec<f32> = logits.iter().map(|v| (v - m).exp()).collect();
-    let s: f32 = p.iter().sum();
+    let s: f64 = p.iter().map(|&v| v as f64).sum();
+    let inv = (1.0 / s) as f32;
     for v in p.iter_mut() {
-        *v /= s;
+        *v *= inv;
     }
-    (m + s.ln(), p)
+    (m + s.ln() as f32, p)
 }

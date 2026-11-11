@@ -3,6 +3,9 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 3 * * *"   # daily: catch engine drift early (engine-head job)
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,3 +73,37 @@ jobs:
       - run: cargo check --target aarch64-linux-android
       - run: cargo check --target x86_64-linux-android
       - run: cargo check --target aarch64-apple-ios
+
+  real-model:
+    name: Real models — engine parity and float64 gradient reference
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python3 -m pip install --user numpy
+      - name: Fetch models from Docker's open model catalog
+        run: |
+          python3 tools/fetch_docker_model.py ai/qwen3:0.6B-Q4_0 qwen3-0.6b-q4_0.gguf
+          python3 tools/fetch_docker_model.py ai/qwen2.5:0.5B-F16 qwen2.5-0.5b-f16.gguf
+          python3 tools/fetch_docker_model.py ai/smollm2:360M-Q4_0 smollm2-360m-q4_0.gguf
+      - run: cargo build --release --example export_reference
+      - name: Logits bit-exact with the engine; gradients vs an independent float64 reference
+        run: |
+          for m in qwen3-0.6b-q4_0 qwen2.5-0.5b-f16 smollm2-360m-q4_0; do
+            echo "== $m"
+            RT_GGUF=$PWD/$m.gguf cargo test --release --test engine real_model -- --ignored
+            ./target/release/examples/export_reference $m.gguf ref.safetensors 4
+            python3 tools/reference_check.py ref.safetensors
+            rm -f ref.safetensors
+          done
+
+  engine-head:
+    name: Engine drift — build and test against the engine's newest commit
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo update -p rie-core
+      - run: git diff --stat Cargo.lock
+      - run: cargo test --release --test engine --test agentd --test gradcheck
