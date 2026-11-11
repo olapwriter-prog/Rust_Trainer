@@ -1,3 +1,5 @@
 /target
 *.ckpt
 /runs
+__pycache__/
+*.pyc
